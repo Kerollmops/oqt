@@ -1,0 +1,10 @@
+[package]
+name = "oqt"
+description = "For optimal query tree"
+version = "0.1.0"
+authors = ["Clément Renault <renault.cle@gmail.com>"]
+edition = "2018"
+
+[dependencies]
+maplit = "1.0.2"
+big_s = "1.0.2"

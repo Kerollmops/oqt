@@ -1,14 +1,13 @@
 use std::collections::HashMap;
-use std::cmp;
+use std::{cmp, fmt};
 
 use maplit::hashmap;
 use big_s::S;
 
-#[derive(Debug)]
 enum Operator {
     And(Vec<Operator>),
     Or(Vec<Operator>),
-    PhraseQuery(Vec<String>),
+    Phrase(Vec<String>),
     Prefix(String),
     Exact(String),
 }
@@ -22,11 +21,33 @@ impl Operator {
         Operator::Exact(s.to_string())
     }
 
-    fn phrase_query<I, S>(iter: I) -> Operator
+    fn phrase<I, S>(iter: I) -> Operator
     where I: IntoIterator<Item=S>,
           S: std::fmt::Display,
     {
-        Operator::PhraseQuery(iter.into_iter().map(|s| s.to_string()).collect())
+        Operator::Phrase(iter.into_iter().map(|s| s.to_string()).collect())
+    }
+}
+
+impl fmt::Debug for Operator {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fn pprint_tree(f: &mut fmt::Formatter<'_>, op: &Operator, depth: usize) -> fmt::Result {
+            match op {
+                Operator::And(children) => {
+                    writeln!(f, "{:1$}AND", "", depth * 2)?;
+                    children.iter().try_for_each(|c| pprint_tree(f, c, depth + 1))
+                },
+                Operator::Or(children) => {
+                    writeln!(f, "{:1$}OR", "", depth * 2)?;
+                    children.iter().try_for_each(|c| pprint_tree(f, c, depth + 1))
+                },
+                Operator::Phrase(phrase) => writeln!(f, "{:2$}PHRASE( {:?} )", "", phrase, depth * 2),
+                Operator::Prefix(text) => writeln!(f, "{:2$}PREFIX( {:?} )", "", text, depth * 2),
+                Operator::Exact(text) => writeln!(f, "{:2$}EXACT(  {:?} )", "", text, depth * 2),
+            }
+        }
+
+        pprint_tree(f, self, 0)
     }
 }
 
@@ -67,7 +88,7 @@ fn create_query_tree(ctx: &Context, words: &[&str]) -> Operator {
     let count = words.len();
     for (i, word) in words.into_iter().enumerate() {
 
-        let pq = split_best_frequency(ctx, word).map(|(l, r)| Operator::phrase_query(&[l, r]));
+        let pq = split_best_frequency(ctx, word).map(|(l, r)| Operator::phrase(&[l, r]));
         let synonyms = synonyms(ctx, word);
 
         let mut alternatives: Vec<_> = synonyms.into_iter().map(Operator::Exact).chain(pq).collect();

@@ -22,11 +22,15 @@ impl Operator {
         Operator::Exact(s.to_string())
     }
 
-    fn phrase<I, S>(iter: I) -> Operator
-    where I: IntoIterator<Item=S>,
-          S: std::fmt::Display,
-    {
-        Operator::Phrase(iter.into_iter().map(|s| s.to_string()).collect())
+    // fn phrase<I, S>(iter: I) -> Operator
+    // where I: IntoIterator<Item=S>,
+    //       S: std::fmt::Display,
+    // {
+    //     Operator::Phrase(iter.into_iter().map(|s| s.to_string()).collect())
+    // }
+
+    fn phrase2((left, right): (&str, &str)) -> Operator {
+        Operator::Phrase(vec![left.to_owned(), right.to_owned()])
     }
 }
 
@@ -52,12 +56,12 @@ impl fmt::Debug for Operator {
     }
 }
 
-type Occurence = usize;
+type Frequency = usize;
 
 #[derive(Debug, Default)]
 struct Context {
     synonyms: HashMap<String, Vec<String>>,
-    words: HashMap<String, Occurence>,
+    words: HashMap<String, Frequency>,
 }
 
 fn split_best_frequency<'a>(ctx: &Context, word: &'a str) -> Option<(&'a str, &'a str)> {
@@ -90,32 +94,83 @@ fn is_last<I: IntoIterator>(iter: I) -> impl Iterator<Item=(bool, I::Item)> {
     })
 }
 
-fn are_whitespaces(s: &&str) -> bool {
-    s.contains(|c: char| c.is_whitespace())
+fn ngram_slice<T>(ngram: usize, slice: &[T]) -> impl Iterator<Item=&[T]> {
+    (0..slice.len()).flat_map(move |i| {
+        (1..=ngram).into_iter().filter_map(move |n| slice.get(i..i + n))
+    })
 }
 
+fn group_by<I, F>(iter: I, f: F) -> impl Iterator<Item=Vec<I::Item>>
+where I: IntoIterator,
+      F: Fn(&I::Item, &I::Item) -> bool,
+{
+    let mut iter = iter.into_iter();
+    let mut prev = None;
+    core::iter::from_fn(move || {
+        let mut out = Vec::new();
+        loop {
+            match (prev.take().or_else(|| iter.next()), iter.next()) {
+                (Some(a), Some(b)) if f(&a, &b) => {
+                    out.push(a);
+                    prev = Some(b);
+                },
+                (Some(a), Some(b)) => {
+                    out.push(a);
+                    prev = Some(b);
+                    return Some(out);
+                },
+                (Some(a), None) => {
+                    out.push(a);
+                    return Some(out);
+                },
+                (None, _) => return None,
+            }
+        }
+    })
+}
+
+const MAX_NGRAM: usize = 3;
+
 fn create_query_tree(ctx: &Context, query: &str) -> Operator {
-    let words = query.linear_group_by_key(|c| c.is_whitespace());
+    let query = query.to_lowercase();
+
+    let words = query.linear_group_by_key(char::is_whitespace);
+    let words: Vec<_> = is_last(words).filter(|(_, s)| !s.contains(char::is_whitespace)).collect();
 
     let mut ands = Vec::new();
-    for (is_last, word) in is_last(words).filter(|(_, s)| !are_whitespaces(s)) {
-        let pq = split_best_frequency(ctx, word).map(|(l, r)| Operator::phrase(&[l, r]));
-        let synonyms = synonyms(ctx, word);
+    for words in group_by(ngram_slice(MAX_NGRAM, &words), |a, b| a[0].1 == b[0].1) {
 
-        let mut alternatives: Vec<_> = synonyms.into_iter().map(Operator::Exact).chain(pq).collect();
+        let mut ops = Vec::new();
+        for words in words {
 
-        let simple = if is_last {
-            Operator::prefix(word)
-        } else {
-            Operator::exact(word)
-        };
+            match words {
+                [(is_last, word)] => {
+                    let phrase = split_best_frequency(ctx, word).map(Operator::phrase2);
+                    let synonyms = synonyms(ctx, word).into_iter().map(Operator::Exact);
 
-        if !alternatives.is_empty() {
-            alternatives.insert(0, simple);
-            ands.push(Operator::Or(alternatives));
-        } else {
-            ands.push(simple);
+                    let original = if *is_last {
+                        Operator::prefix(word)
+                    } else {
+                        Operator::exact(word)
+                    };
+
+                    let mut alternatives: Vec<_> = synonyms.chain(phrase).collect();
+
+                    if !alternatives.is_empty() {
+                        ops.push(original);
+                        ops.append(&mut alternatives);
+                    } else {
+                        ops.push(original);
+                    }
+                },
+                words => {
+                    let concat = words.iter().map(|(_, s)| *s).collect();
+                    ops.push(Operator::Exact(concat));
+                }
+            }
         }
+
+        ands.push(Operator::Or(ops));
     }
 
     Operator::And(ands)

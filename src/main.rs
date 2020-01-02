@@ -1,8 +1,9 @@
 use std::collections::HashMap;
 use std::{cmp, fmt};
 
-use maplit::hashmap;
 use big_s::S;
+use maplit::hashmap;
+use slice_group_by::StrGroupBy;
 
 enum Operator {
     And(Vec<Operator>),
@@ -82,34 +83,37 @@ fn synonyms(ctx: &Context, word: &str) -> Vec<String> {
     ctx.synonyms.get(word).cloned().unwrap_or_default()
 }
 
-fn create_query_tree(ctx: &Context, words: &[&str]) -> Operator {
+fn is_last<I: IntoIterator>(iter: I) -> impl Iterator<Item=(bool, I::Item)> {
+    let mut iter = iter.into_iter().peekable();
+    core::iter::from_fn(move || {
+        iter.next().map(|item| (iter.peek().is_none(), item))
+    })
+}
+
+fn are_whitespaces(s: &&str) -> bool {
+    s.contains(|c: char| c.is_whitespace())
+}
+
+fn create_query_tree(ctx: &Context, query: &str) -> Operator {
+    let words = query.linear_group_by_key(|c| c.is_whitespace());
+
     let mut ands = Vec::new();
-
-    let count = words.len();
-    for (i, word) in words.into_iter().enumerate() {
-
+    for (is_last, word) in is_last(words).filter(|(_, s)| !are_whitespaces(s)) {
         let pq = split_best_frequency(ctx, word).map(|(l, r)| Operator::phrase(&[l, r]));
         let synonyms = synonyms(ctx, word);
 
         let mut alternatives: Vec<_> = synonyms.into_iter().map(Operator::Exact).chain(pq).collect();
 
+        let simple = if is_last {
+            Operator::prefix(word)
+        } else {
+            Operator::exact(word)
+        };
+
         if !alternatives.is_empty() {
-
-            let simple = if count - 1 == i { // is last?
-                Operator::prefix(word)
-            } else {
-                Operator::exact(word)
-            };
-
             alternatives.insert(0, simple);
             ands.push(Operator::Or(alternatives));
         } else {
-            let simple = if count - 1 == i { // is last?
-                Operator::prefix(word)
-            } else {
-                Operator::exact(word)
-            };
-
             ands.push(simple);
         }
     }
@@ -130,9 +134,8 @@ fn main() {
         },
     };
 
-    let words = &["hello", "world"];
-    let query_tree = create_query_tree(&context, words);
+    let query = std::env::args().nth(1).unwrap_or(S("hello world"));
+    let query_tree = create_query_tree(&context, &query);
 
-    println!("{:?}", words);
     println!("{:?}", query_tree);
 }

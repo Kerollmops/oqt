@@ -16,8 +16,15 @@ version = "0.1.0"
 dependencies = [
  "big_s 1.0.2 (registry+https://github.com/rust-lang/crates.io-index)",
  "maplit 1.0.2 (registry+https://github.com/rust-lang/crates.io-index)",
+ "slice-group-by 0.2.6 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
+
+[[package]]
+name = "slice-group-by"
+version = "0.2.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
 
 [metadata]
 "checksum big_s 1.0.2 (registry+https://github.com/rust-lang/crates.io-index)" = "199edb7b90631283b10c2422e6a0bc8b7d987bf732995ba1de53b576c97e51a8"
 "checksum maplit 1.0.2 (registry+https://github.com/rust-lang/crates.io-index)" = "3e2e65a1a2e43cfcb47a895c4c8b10d1f4a61097f9f254f183aee60cad9c651d"
+"checksum slice-group-by 0.2.6 (registry+https://github.com/rust-lang/crates.io-index)" = "1f7474f0b646d228360ab62ed974744617bc869d959eac8403bfa3665931a7fb"

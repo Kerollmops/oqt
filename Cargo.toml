@@ -8,3 +8,4 @@ edition = "2018"
 [dependencies]
 maplit = "1.0.2"
 big_s = "1.0.2"
+slice-group-by = "0.2.6"

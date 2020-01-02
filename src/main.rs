@@ -1,9 +1,10 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, BTreeSet};
 use std::{cmp, fmt};
 
 use big_s::S;
 use maplit::hashmap;
 use slice_group_by::StrGroupBy;
+use rand::{Rng, SeedableRng, rngs::StdRng};
 
 enum Operator {
     And(Vec<Operator>),
@@ -21,13 +22,6 @@ impl Operator {
     fn exact(s: &str) -> Operator {
         Operator::Exact(s.to_string())
     }
-
-    // fn phrase<I, S>(iter: I) -> Operator
-    // where I: IntoIterator<Item=S>,
-    //       S: std::fmt::Display,
-    // {
-    //     Operator::Phrase(iter.into_iter().map(|s| s.to_string()).collect())
-    // }
 
     fn phrase2((left, right): (&str, &str)) -> Operator {
         Operator::Phrase(vec![left.to_owned(), right.to_owned()])
@@ -56,12 +50,12 @@ impl fmt::Debug for Operator {
     }
 }
 
-type Frequency = usize;
+type DocId = u16;
 
 #[derive(Debug, Default)]
 struct Context {
     synonyms: HashMap<String, Vec<String>>,
-    words: HashMap<String, Frequency>,
+    postings: HashMap<String, Vec<DocId>>,
 }
 
 fn split_best_frequency<'a>(ctx: &Context, word: &'a str) -> Option<(&'a str, &'a str)> {
@@ -71,8 +65,8 @@ fn split_best_frequency<'a>(ctx: &Context, word: &'a str) -> Option<(&'a str, &'
     for (i, _) in chars {
         let (left, right) = word.split_at(i);
 
-        let left_freq = ctx.words.get(left).copied().unwrap_or(0);
-        let right_freq = ctx.words.get(right).copied().unwrap_or(0);
+        let left_freq = ctx.postings.get(left).map(Vec::len).unwrap_or(0);
+        let right_freq = ctx.postings.get(right).map(Vec::len).unwrap_or(0);
 
         let min_freq = cmp::min(left_freq, right_freq);
         if min_freq != 0 && best.map_or(true, |(old, _, _)| min_freq > old) {
@@ -91,6 +85,14 @@ fn is_last<I: IntoIterator>(iter: I) -> impl Iterator<Item=(bool, I::Item)> {
     let mut iter = iter.into_iter().peekable();
     core::iter::from_fn(move || {
         iter.next().map(|item| (iter.peek().is_none(), item))
+    })
+}
+
+fn is_first<I: IntoIterator>(iter: I) -> impl Iterator<Item=(bool, I::Item)> {
+    let mut iter = iter.into_iter();
+    let mut is_first = true;
+    core::iter::from_fn(move || {
+        iter.next().map(|item| (core::mem::take(&mut is_first), item))
     })
 }
 
@@ -176,16 +178,36 @@ fn create_query_tree(ctx: &Context, query: &str) -> Operator {
     Operator::And(ands)
 }
 
+fn random_docs<R: Rng>(rng: &mut R, len: usize) -> Vec<DocId> {
+    let mut values = BTreeSet::new();
+    while values.len() != len {
+        values.insert(rng.gen());
+    }
+    values.into_iter().collect()
+}
+
 fn main() {
+    let mut rng = StdRng::seed_from_u64(42);
+    let rng = &mut rng;
+
     let context = Context {
         synonyms: hashmap!{
             S("hello") => vec![S("hi")],
             S("world") => vec![S("earth"), S("nature")],
         },
-        words: hashmap!{
-            S("hell") => 25,
-            S("o") => 4,
-            S("worl") => 14,
+        postings: hashmap!{
+            S("hello")      => random_docs(rng, 1500),
+            S("helloworld") => random_docs(rng, 100),
+            S("hi")         => random_docs(rng, 4000),
+            S("hell")       => random_docs(rng, 2500),
+            S("o")          => random_docs(rng, 400),
+            S("worl")       => random_docs(rng, 1400),
+            S("world")      => random_docs(rng, 15000),
+            S("earth")      => random_docs(rng, 8000),
+            S("2020")       => random_docs(rng, 100),
+            S("2019")       => random_docs(rng, 500),
+            S("is")         => random_docs(rng, 50000),
+            S("this")       => random_docs(rng, 50000),
         },
     };
 
@@ -193,4 +215,60 @@ fn main() {
     let query_tree = create_query_tree(&context, &query);
 
     println!("{:?}", query_tree);
+
+    println!("---------------------------------\n");
+
+    match query_tree {
+        Operator::And(ops) => {
+            let mut and_ids = HashSet::new();
+
+            for (is_first, op) in is_first(ops) {
+                match op {
+                    Operator::Or(ops) => {
+                        let mut or_ids = HashSet::new();
+
+                        for op in &ops {
+                            match op {
+                                Operator::Exact(word) => {
+                                    let mut word_ids = HashSet::<DocId>::new();
+
+                                    if let Some(ids) = context.postings.get(word) {
+                                        word_ids.extend(ids);
+                                    }
+
+                                    println!("  {:?} retrieve {} documents", word, word_ids.len());
+                                    or_ids.extend(word_ids);
+                                },
+                                Operator::Prefix(word) => {
+                                    let mut word_ids = HashSet::<DocId>::new();
+
+                                    if let Some(ids) = context.postings.get(word) {
+                                        word_ids.extend(ids);
+                                    }
+
+                                    println!("  {:?}* retrieve {} documents", word, word_ids.len());
+                                    or_ids.extend(word_ids);
+                                },
+                                op => println!("  ignored"),
+                            }
+                        }
+
+                        println!("OP retrieve {} documents", or_ids.len());
+
+                        if is_first {
+                            and_ids = or_ids;
+                        } else {
+                            let old = std::mem::replace(&mut and_ids, HashSet::new());
+                            and_ids.extend(old.intersection(&or_ids));
+                        }
+                        println!("AND as now {} documents", and_ids.len());
+                    },
+                    _ => unimplemented!(),
+                }
+
+            }
+
+        },
+        _ => unimplemented!(),
+    }
 }

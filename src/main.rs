@@ -3,8 +3,8 @@ use std::{cmp, fmt};
 
 use big_s::S;
 use maplit::hashmap;
-use slice_group_by::StrGroupBy;
 use rand::{Rng, SeedableRng, rngs::StdRng};
+use slice_group_by::StrGroupBy;
 
 enum Operation {
     And(Vec<Operation>),
@@ -34,18 +34,19 @@ impl fmt::Debug for Operation {
 
 #[derive(Debug)]
 enum Query {
-    Phrase(Vec<String>),
-    Prefix(String),
+    Tolerant(String),
     Exact(String),
+    Prefix(String),
+    Phrase(Vec<String>),
 }
 
 impl Query {
-    fn prefix(s: &str) -> Query {
-        Query::Prefix(s.to_string())
+    fn tolerant(s: &str) -> Query {
+        Query::Tolerant(s.to_string())
     }
 
-    fn exact(s: &str) -> Query {
-        Query::Exact(s.to_string())
+    fn prefix(s: &str) -> Query {
+        Query::Prefix(s.to_string())
     }
 
     fn phrase2((left, right): (&str, &str)) -> Query {
@@ -91,14 +92,6 @@ fn is_last<I: IntoIterator>(iter: I) -> impl Iterator<Item=(bool, I::Item)> {
     })
 }
 
-fn is_first<I: IntoIterator>(iter: I) -> impl Iterator<Item=(bool, I::Item)> {
-    let mut iter = iter.into_iter();
-    let mut is_first = true;
-    core::iter::from_fn(move || {
-        iter.next().map(|item| (core::mem::take(&mut is_first), item))
-    })
-}
-
 fn ngram_slice<T>(ngram: usize, slice: &[T]) -> impl Iterator<Item=&[T]> {
     (0..slice.len()).flat_map(move |i| {
         (1..=ngram).into_iter().filter_map(move |n| slice.get(i..i + n))
@@ -134,6 +127,17 @@ where I: IntoIterator,
     })
 }
 
+fn create_operation<I, F>(iter: I, f: F) -> Operation
+where I: IntoIterator<Item=Operation>,
+      F: Fn(Vec<Operation>) -> Operation,
+{
+    let mut iter = iter.into_iter();
+    match (iter.next(), iter.next()) {
+        (Some(first), None) => first,
+        (first, second) => f(first.into_iter().chain(second).chain(iter).collect()),
+    }
+}
+
 const MAX_NGRAM: usize = 3;
 
 fn create_query_tree(ctx: &Context, query: &str) -> Operation {
@@ -152,18 +156,14 @@ fn create_query_tree(ctx: &Context, query: &str) -> Operation {
                 [(is_last, word)] => {
                     let phrase = split_best_frequency(ctx, word).map(Query::phrase2).map(Operation::Query);
                     let synonyms = synonyms(ctx, word).into_iter().map(|alts| {
-                        let mut parts: Vec<_> = alts.into_iter().map(Query::Exact).map(Operation::Query).collect();
-                        if parts.len() == 1 {
-                            parts.pop().unwrap()
-                        } else {
-                            Operation::And(parts)
-                        }
+                        let iter = alts.into_iter().map(Query::Exact).map(Operation::Query);
+                        create_operation(iter, Operation::And)
                     });
 
                     let original = if *is_last {
                         Query::prefix(word)
                     } else {
-                        Query::exact(word)
+                        Query::tolerant(word)
                     };
 
                     let mut alternatives: Vec<_> = synonyms.chain(phrase).collect();
@@ -182,11 +182,11 @@ fn create_query_tree(ctx: &Context, query: &str) -> Operation {
             }
         }
 
-        let ops = ops.into_iter().collect();
-        ands.push(Operation::Or(ops));
+        let ops = create_operation(ops, Operation::Or);
+        ands.push(ops)
     }
 
-    Operation::And(ands)
+    create_operation(ands, Operation::And)
 }
 
 fn random_docs<R: Rng>(rng: &mut R, len: usize) -> Vec<DocId> {
@@ -195,6 +195,81 @@ fn random_docs<R: Rng>(rng: &mut R, len: usize) -> Vec<DocId> {
         values.insert(rng.gen());
     }
     values.into_iter().collect()
+}
+
+fn traverse_query_tree(ctx: &Context, tree: &Operation) -> HashSet<DocId> {
+
+    fn execute_and(ctx: &Context, depth: usize, operations: &[Operation]) -> HashSet<DocId> {
+        println!("{:1$}AND", "", depth * 2);
+
+        let mut ids = None;
+
+        for op in operations {
+            let result = match op {
+                Operation::And(operations) => execute_and(ctx, depth + 1, &operations),
+                Operation::Or(operations) => execute_or(ctx, depth + 1, &operations),
+                Operation::Query(query) => execute_query(ctx, depth + 1, &query),
+            };
+
+            match ids {
+                Some(ref mut ids) => {
+                    let old = std::mem::replace(ids, HashSet::new());
+                    ids.extend(old.intersection(&result));
+                },
+                None => ids = Some(result),
+            }
+        }
+
+        let ids = ids.unwrap_or_default();
+
+        println!("{:2$}--- AND found {}", "", ids.len(), depth * 2);
+
+        ids
+    }
+
+    fn execute_or(ctx: &Context, depth: usize, operations: &[Operation]) -> HashSet<DocId> {
+        println!("{:1$}OR", "", depth * 2);
+
+        let mut ids = HashSet::new();
+
+        for op in operations {
+            let result = match op {
+                Operation::And(operations) => execute_and(ctx, depth + 1, &operations),
+                Operation::Or(operations) => execute_or(ctx, depth + 1, &operations),
+                Operation::Query(query) => execute_query(ctx, depth + 1, &query),
+            };
+
+            ids.extend(result);
+        }
+
+        println!("{:2$}--- OR found {}", "", ids.len(), depth * 2);
+
+        ids
+    }
+
+    fn execute_query(ctx: &Context, depth: usize, query: &Query) -> HashSet<DocId> {
+        match query {
+            Query::Tolerant(word) | Query::Exact(word) | Query::Prefix(word) => {
+                if let Some(pl) = ctx.postings.get(word) {
+                    println!("{:3$}{:?} found {:?} words", "", word, pl.len(), depth * 2);
+                    pl.into_iter().copied().collect()
+                } else {
+                    println!("{:2$}{:?} found nothing", "", word, depth * 2);
+                    HashSet::new()
+                }
+            },
+            Query::Phrase(words) => {
+                println!("{:2$}ignored {:?}", "", words, depth * 2);
+                HashSet::new()
+            },
+        }
+    }
+
+    match tree {
+        Operation::And(operations) => execute_and(ctx, 0, &operations),
+        Operation::Or(operations) => execute_or(ctx, 0, &operations),
+        Operation::Query(query) => execute_query(ctx, 0, &query),
+    }
 }
 
 fn main() {
@@ -225,6 +300,8 @@ fn main() {
             S("2019")       => random_docs(rng,    500),
             S("is")         => random_docs(rng, 50_000),
             S("this")       => random_docs(rng, 50_000),
+            S("good")       => random_docs(rng,   1250),
+            S("morning")    => random_docs(rng,     12),
         },
     };
 
@@ -235,57 +312,7 @@ fn main() {
 
     println!("---------------------------------\n");
 
-    match query_tree {
-        Operation::And(ops) => {
-            let mut and_ids = HashSet::new();
+    let docids = traverse_query_tree(&context, &query_tree);
 
-            for (is_first, op) in is_first(ops) {
-                match op {
-                    Operation::Or(ops) => {
-                        let mut or_ids = HashSet::new();
-
-                        for op in &ops {
-                            match op {
-                                Operation::Query(Query::Exact(word)) => {
-                                    let mut word_ids = HashSet::<DocId>::new();
-
-                                    if let Some(ids) = context.postings.get(word) {
-                                        word_ids.extend(ids);
-                                    }
-
-                                    println!("  {:?} retrieve {} documents", word, word_ids.len());
-                                    or_ids.extend(word_ids);
-                                },
-                                Operation::Query(Query::Prefix(word)) => {
-                                    let mut word_ids = HashSet::<DocId>::new();
-
-                                    if let Some(ids) = context.postings.get(word) {
-                                        word_ids.extend(ids);
-                                    }
-
-                                    println!("  {:?}* retrieve {} documents", word, word_ids.len());
-                                    or_ids.extend(word_ids);
-                                },
-                                op => println!("  ignored"),
-                            }
-                        }
-
-                        println!("OP retrieve {} documents", or_ids.len());
-
-                        if is_first {
-                            and_ids = or_ids;
-                        } else {
-                            let old = std::mem::replace(&mut and_ids, HashSet::new());
-                            and_ids.extend(old.intersection(&or_ids));
-                        }
-                        println!("AND sees {} documents", and_ids.len());
-                    },
-                    _ => unimplemented!(),
-                }
-
-            }
-
-        },
-        _ => unimplemented!(),
-    }
+    println!("found {:?} documents", docids.len());
 }

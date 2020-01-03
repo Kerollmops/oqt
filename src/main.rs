@@ -6,43 +6,25 @@ use maplit::hashmap;
 use slice_group_by::StrGroupBy;
 use rand::{Rng, SeedableRng, rngs::StdRng};
 
-enum Operator {
-    And(Vec<Operator>),
-    Or(Vec<Operator>),
-    Phrase(Vec<String>),
-    Prefix(String),
-    Exact(String),
+enum Operation {
+    And(Vec<Operation>),
+    Or(Vec<Operation>),
+    Query(Query),
 }
 
-impl Operator {
-    fn prefix(s: &str) -> Operator {
-        Operator::Prefix(s.to_string())
-    }
-
-    fn exact(s: &str) -> Operator {
-        Operator::Exact(s.to_string())
-    }
-
-    fn phrase2((left, right): (&str, &str)) -> Operator {
-        Operator::Phrase(vec![left.to_owned(), right.to_owned()])
-    }
-}
-
-impl fmt::Debug for Operator {
+impl fmt::Debug for Operation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fn pprint_tree(f: &mut fmt::Formatter<'_>, op: &Operator, depth: usize) -> fmt::Result {
+        fn pprint_tree(f: &mut fmt::Formatter<'_>, op: &Operation, depth: usize) -> fmt::Result {
             match op {
-                Operator::And(children) => {
+                Operation::And(children) => {
                     writeln!(f, "{:1$}AND", "", depth * 2)?;
                     children.iter().try_for_each(|c| pprint_tree(f, c, depth + 1))
                 },
-                Operator::Or(children) => {
+                Operation::Or(children) => {
                     writeln!(f, "{:1$}OR", "", depth * 2)?;
                     children.iter().try_for_each(|c| pprint_tree(f, c, depth + 1))
                 },
-                Operator::Phrase(phrase) => writeln!(f, "{:2$}PHRASE( {:?} )", "", phrase, depth * 2),
-                Operator::Prefix(text) => writeln!(f, "{:2$}PREFIX( {:?} )", "", text, depth * 2),
-                Operator::Exact(text) => writeln!(f, "{:2$}EXACT(  {:?} )", "", text, depth * 2),
+                Operation::Query(query) => writeln!(f, "{:2$}{:?}", "", query, depth * 2),
             }
         }
 
@@ -50,11 +32,32 @@ impl fmt::Debug for Operator {
     }
 }
 
+#[derive(Debug)]
+enum Query {
+    Phrase(Vec<String>),
+    Prefix(String),
+    Exact(String),
+}
+
+impl Query {
+    fn prefix(s: &str) -> Query {
+        Query::Prefix(s.to_string())
+    }
+
+    fn exact(s: &str) -> Query {
+        Query::Exact(s.to_string())
+    }
+
+    fn phrase2((left, right): (&str, &str)) -> Query {
+        Query::Phrase(vec![left.to_owned(), right.to_owned()])
+    }
+}
+
 type DocId = u16;
 
 #[derive(Debug, Default)]
 struct Context {
-    synonyms: HashMap<String, Vec<String>>,
+    synonyms: HashMap<String, Vec<Vec<String>>>,
     postings: HashMap<String, Vec<DocId>>,
 }
 
@@ -77,7 +80,7 @@ fn split_best_frequency<'a>(ctx: &Context, word: &'a str) -> Option<(&'a str, &'
     best.map(|(_, l, r)| (l, r))
 }
 
-fn synonyms(ctx: &Context, word: &str) -> Vec<String> {
+fn synonyms(ctx: &Context, word: &str) -> Vec<Vec<String>> {
     ctx.synonyms.get(word).cloned().unwrap_or_default()
 }
 
@@ -133,7 +136,7 @@ where I: IntoIterator,
 
 const MAX_NGRAM: usize = 3;
 
-fn create_query_tree(ctx: &Context, query: &str) -> Operator {
+fn create_query_tree(ctx: &Context, query: &str) -> Operation {
     let query = query.to_lowercase();
 
     let words = query.linear_group_by_key(char::is_whitespace);
@@ -147,35 +150,43 @@ fn create_query_tree(ctx: &Context, query: &str) -> Operator {
 
             match words {
                 [(is_last, word)] => {
-                    let phrase = split_best_frequency(ctx, word).map(Operator::phrase2);
-                    let synonyms = synonyms(ctx, word).into_iter().map(Operator::Exact);
+                    let phrase = split_best_frequency(ctx, word).map(Query::phrase2).map(Operation::Query);
+                    let synonyms = synonyms(ctx, word).into_iter().map(|alts| {
+                        let mut parts: Vec<_> = alts.into_iter().map(Query::Exact).map(Operation::Query).collect();
+                        if parts.len() == 1 {
+                            parts.pop().unwrap()
+                        } else {
+                            Operation::And(parts)
+                        }
+                    });
 
                     let original = if *is_last {
-                        Operator::prefix(word)
+                        Query::prefix(word)
                     } else {
-                        Operator::exact(word)
+                        Query::exact(word)
                     };
 
                     let mut alternatives: Vec<_> = synonyms.chain(phrase).collect();
 
                     if !alternatives.is_empty() {
-                        ops.push(original);
+                        ops.push(Operation::Query(original));
                         ops.append(&mut alternatives);
                     } else {
-                        ops.push(original);
+                        ops.push(Operation::Query(original));
                     }
                 },
                 words => {
                     let concat = words.iter().map(|(_, s)| *s).collect();
-                    ops.push(Operator::Exact(concat));
+                    ops.push(Operation::Query(Query::Exact(concat)));
                 }
             }
         }
 
-        ands.push(Operator::Or(ops));
+        let ops = ops.into_iter().collect();
+        ands.push(Operation::Or(ops));
     }
 
-    Operator::And(ands)
+    Operation::And(ands)
 }
 
 fn random_docs<R: Rng>(rng: &mut R, len: usize) -> Vec<DocId> {
@@ -192,22 +203,28 @@ fn main() {
 
     let context = Context {
         synonyms: hashmap!{
-            S("hello") => vec![S("hi")],
-            S("world") => vec![S("earth"), S("nature")],
+            S("hello") => vec![
+                vec![S("hi")],
+                vec![S("good"), S("morning")],
+            ],
+            S("world") => vec![
+                vec![S("earth")],
+                vec![S("nature")]
+            ],
         },
         postings: hashmap!{
-            S("hello")      => random_docs(rng, 1500),
-            S("helloworld") => random_docs(rng, 100),
-            S("hi")         => random_docs(rng, 4000),
-            S("hell")       => random_docs(rng, 2500),
-            S("o")          => random_docs(rng, 400),
-            S("worl")       => random_docs(rng, 1400),
-            S("world")      => random_docs(rng, 15000),
-            S("earth")      => random_docs(rng, 8000),
-            S("2020")       => random_docs(rng, 100),
-            S("2019")       => random_docs(rng, 500),
-            S("is")         => random_docs(rng, 50000),
-            S("this")       => random_docs(rng, 50000),
+            S("hello")      => random_docs(rng,   1500),
+            S("helloworld") => random_docs(rng,    100),
+            S("hi")         => random_docs(rng,   4000),
+            S("hell")       => random_docs(rng,   2500),
+            S("o")          => random_docs(rng,    400),
+            S("worl")       => random_docs(rng,   1400),
+            S("world")      => random_docs(rng, 15_000),
+            S("earth")      => random_docs(rng,   8000),
+            S("2020")       => random_docs(rng,    100),
+            S("2019")       => random_docs(rng,    500),
+            S("is")         => random_docs(rng, 50_000),
+            S("this")       => random_docs(rng, 50_000),
         },
     };
 
@@ -219,17 +236,17 @@ fn main() {
     println!("---------------------------------\n");
 
     match query_tree {
-        Operator::And(ops) => {
+        Operation::And(ops) => {
             let mut and_ids = HashSet::new();
 
             for (is_first, op) in is_first(ops) {
                 match op {
-                    Operator::Or(ops) => {
+                    Operation::Or(ops) => {
                         let mut or_ids = HashSet::new();
 
                         for op in &ops {
                             match op {
-                                Operator::Exact(word) => {
+                                Operation::Query(Query::Exact(word)) => {
                                     let mut word_ids = HashSet::<DocId>::new();
 
                                     if let Some(ids) = context.postings.get(word) {
@@ -239,7 +256,7 @@ fn main() {
                                     println!("  {:?} retrieve {} documents", word, word_ids.len());
                                     or_ids.extend(word_ids);
                                 },
-                                Operator::Prefix(word) => {
+                                Operation::Query(Query::Prefix(word)) => {
                                     let mut word_ids = HashSet::<DocId>::new();
 
                                     if let Some(ids) = context.postings.get(word) {
@@ -261,7 +278,7 @@ fn main() {
                             let old = std::mem::replace(&mut and_ids, HashSet::new());
                             and_ids.extend(old.intersection(&or_ids));
                         }
-                        println!("AND as now {} documents", and_ids.len());
+                        println!("AND sees {} documents", and_ids.len());
                     },
                     _ => unimplemented!(),
                 }

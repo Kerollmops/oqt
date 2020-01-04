@@ -1,5 +1,6 @@
 use std::collections::{HashMap, BTreeSet, BTreeMap};
 use std::iter::FromIterator;
+use std::time::Instant;
 use std::{cmp, fmt, iter, mem};
 
 use big_s::S;
@@ -197,6 +198,7 @@ fn traverse_query_tree(ctx: &Context, tree: &Operation) -> HashMap<DocId, Vec<Po
     fn execute_and(ctx: &Context, depth: usize, operations: &[Operation]) -> HashMap<DocId, Vec<Position>> {
         println!("{:1$}AND", "", depth * 2);
 
+        let before = Instant::now();
         let mut ids = None;
 
         for op in operations {
@@ -206,26 +208,26 @@ fn traverse_query_tree(ctx: &Context, tree: &Operation) -> HashMap<DocId, Vec<Po
                 Operation::Query(query) => execute_query(ctx, depth + 1, &query),
             };
 
+            let before = Instant::now();
             match ids {
                 Some(ref mut ids) => {
                     let mut old = mem::replace(ids, HashMap::new());
                     for (id, mut positions) in result {
                         if let Some(ref mut bpos) = old.remove(&id) {
                             positions.append(bpos);
-                            positions.sort_unstable();
-                            positions.dedup();
                             ids.insert(id, positions);
                         }
                     }
-
                 },
                 None => ids = Some(result),
             }
+            println!("AND loop took {:.02?}", before.elapsed());
         }
 
         let ids = ids.unwrap_or_default();
 
-        println!("{:2$}--- AND fetched {}", "", ids.len(), depth * 2);
+        println!("{:3$}--- AND fetched {} documents in {:.02?}",
+            "", ids.len(), before.elapsed(), depth * 2);
 
         ids
     }
@@ -233,6 +235,7 @@ fn traverse_query_tree(ctx: &Context, tree: &Operation) -> HashMap<DocId, Vec<Po
     fn execute_or(ctx: &Context, depth: usize, operations: &[Operation]) -> HashMap<DocId, Vec<Position>> {
         println!("{:1$}OR", "", depth * 2);
 
+        let before = Instant::now();
         let mut ids = HashMap::new();
 
         for op in operations {
@@ -242,16 +245,17 @@ fn traverse_query_tree(ctx: &Context, tree: &Operation) -> HashMap<DocId, Vec<Po
                 Operation::Query(query) => execute_query(ctx, depth + 1, &query),
             };
 
+            let before = Instant::now();
             for (id, ref mut positions) in result {
-                let pos = ids.entry(id).or_insert_with(Vec::new);
-                pos.append(positions);
-                pos.sort_unstable();
-                pos.dedup();
+                ids.entry(id)
+                    .and_modify(|p: &mut Vec<_>| p.append(positions))
+                    .or_insert_with(Vec::new);
             }
-
+            println!("OR loop took {:.02?}", before.elapsed());
         }
 
-        println!("{:2$}--- OR fetched {}", "", ids.len(), depth * 2);
+        println!("{:3$}--- OR fetched {} documents in {:.02?}",
+            "", ids.len(), before.elapsed(), depth * 2);
 
         ids
     }
@@ -259,15 +263,21 @@ fn traverse_query_tree(ctx: &Context, tree: &Operation) -> HashMap<DocId, Vec<Po
     fn execute_query(ctx: &Context, depth: usize, query: &Query) -> HashMap<DocId, Vec<Position>> {
         match query {
             Query::Tolerant(word) | Query::Exact(word) | Query::Prefix(word) => {
+                let before = Instant::now();
+
                 if let Some(pl) = ctx.postings.get(word) {
-                    println!("{:3$}{:?} fetched {:?} documents", "", word, pl.len(), depth * 2);
+                    println!("{:4$}{:?} fetched {:?} documents in {:.02?}",
+                        "", word, pl.len(), before.elapsed(), depth * 2);
                     pl.into_iter().cloned().collect()
                 } else {
-                    println!("{:2$}{:?} fetched nothing", "", word, depth * 2);
+                    println!("{:3$}{:?} fetched nothing in {:.02?}",
+                        "", word, before.elapsed(), depth * 2);
                     HashMap::new()
                 }
             },
             Query::Phrase(words) => {
+                let before = Instant::now();
+
                 let first = execute_query(ctx, depth + 1, &Query::Exact(words[0].to_owned()));
                 let first = BTreeMap::from_iter(first);
 
@@ -294,18 +304,26 @@ fn traverse_query_tree(ctx: &Context, tree: &Operation) -> HashMap<DocId, Vec<Po
                     }
                 }
 
-                println!("{:3$}{:?} fetched {:?} documents", "", words, result.len(), depth * 2);
+                println!("{:4$}{:?} fetched {:?} documents in {:.02?}",
+                    "", words, result.len(), before.elapsed(), depth * 2);
 
                 result
             },
         }
     }
 
-    match tree {
+    let mut result = match tree {
         Operation::And(operations) => execute_and(ctx, 0, &operations),
         Operation::Or(operations) => execute_or(ctx, 0, &operations),
         Operation::Query(query) => execute_query(ctx, 0, &query),
-    }
+    };
+
+    result.iter_mut().for_each(|(_, positions)| {
+        positions.sort_unstable();
+        positions.dedup();
+    });
+
+    result
 }
 
 fn random_docs<R: Rng>(rng: &mut R, len: usize) -> Vec<(DocId, Vec<Position>)> {
@@ -314,7 +332,8 @@ fn random_docs<R: Rng>(rng: &mut R, len: usize) -> Vec<(DocId, Vec<Position>)> {
         values.insert(rng.gen());
     }
     values.into_iter().map(|id| {
-        let positions = iter::repeat_with(|| rng.gen()).take(20).collect();
+        let len = rng.gen_range(1, 12);
+        let positions = iter::repeat_with(|| rng.gen()).take(len).collect();
         (id, positions)
     }).collect()
 }

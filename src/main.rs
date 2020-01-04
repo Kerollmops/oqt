@@ -1,10 +1,11 @@
-use std::collections::{HashMap, HashSet, BTreeSet};
+use std::collections::{HashMap, BTreeSet};
 use std::time::Instant;
-use std::{cmp, fmt, mem};
+use std::{cmp, fmt};
 
 use big_s::S;
 use maplit::hashmap;
 use rand::{Rng, SeedableRng, rngs::StdRng};
+use sdset::{SetBuf, SetOperation};
 use slice_group_by::StrGroupBy;
 
 enum Operation {
@@ -191,13 +192,13 @@ fn create_query_tree(ctx: &Context, query: &str) -> Operation {
     create_operation(ands, Operation::And)
 }
 
-fn traverse_query_tree(ctx: &Context, tree: &Operation) -> HashSet<DocId> {
+fn traverse_query_tree(ctx: &Context, tree: &Operation) -> SetBuf<DocId> {
 
-    fn execute_and(ctx: &Context, depth: usize, operations: &[Operation]) -> HashSet<DocId> {
+    fn execute_and(ctx: &Context, depth: usize, operations: &[Operation]) -> SetBuf<DocId> {
         println!("{:1$}AND", "", depth * 2);
 
         let before = Instant::now();
-        let mut ids = None;
+        let mut results = Vec::new();
 
         for op in operations {
             let result = match op {
@@ -206,18 +207,12 @@ fn traverse_query_tree(ctx: &Context, tree: &Operation) -> HashSet<DocId> {
                 Operation::Query(query) => execute_query(ctx, depth + 1, &query),
             };
 
-            let before = Instant::now();
-            match ids {
-                Some(ref mut ids) => {
-                    let old = mem::replace(ids, HashSet::new());
-                    ids.extend(old.intersection(&result));
-                },
-                None => ids = Some(result),
-            }
-            println!("AND loop took {:.02?}", before.elapsed());
+            results.push(result);
         }
 
-        let ids = ids.unwrap_or_default();
+        let results = results.iter().map(|s| s.as_set()).collect();
+        let op = sdset::multi::Intersection::new(results);
+        let ids = op.into_set_buf();
 
         println!("{:3$}--- AND fetched {} documents in {:.02?}",
             "", ids.len(), before.elapsed(), depth * 2);
@@ -225,11 +220,11 @@ fn traverse_query_tree(ctx: &Context, tree: &Operation) -> HashSet<DocId> {
         ids
     }
 
-    fn execute_or(ctx: &Context, depth: usize, operations: &[Operation]) -> HashSet<DocId> {
+    fn execute_or(ctx: &Context, depth: usize, operations: &[Operation]) -> SetBuf<DocId> {
         println!("{:1$}OR", "", depth * 2);
 
         let before = Instant::now();
-        let mut ids = HashSet::new();
+        let mut ids = Vec::new();
 
         for op in operations {
             let result = match op {
@@ -238,10 +233,10 @@ fn traverse_query_tree(ctx: &Context, tree: &Operation) -> HashSet<DocId> {
                 Operation::Query(query) => execute_query(ctx, depth + 1, &query),
             };
 
-            let before = Instant::now();
             ids.extend(result);
-            println!("OR loop took {:.02?}", before.elapsed());
         }
+
+        let ids = SetBuf::from_dirty(ids);
 
         println!("{:3$}--- OR fetched {} documents in {:.02?}",
             "", ids.len(), before.elapsed(), depth * 2);
@@ -249,7 +244,7 @@ fn traverse_query_tree(ctx: &Context, tree: &Operation) -> HashSet<DocId> {
         ids
     }
 
-    fn execute_query(ctx: &Context, depth: usize, query: &Query) -> HashSet<DocId> {
+    fn execute_query(ctx: &Context, depth: usize, query: &Query) -> SetBuf<DocId> {
         match query {
             Query::Tolerant(word) | Query::Exact(word) | Query::Prefix(word) => {
                 let before = Instant::now();
@@ -257,16 +252,16 @@ fn traverse_query_tree(ctx: &Context, tree: &Operation) -> HashSet<DocId> {
                 if let Some(pl) = ctx.postings.get(word) {
                     println!("{:4$}{:?} fetched {:?} documents in {:.02?}",
                         "", word, pl.len(), before.elapsed(), depth * 2);
-                    pl.into_iter().copied().collect()
+                    SetBuf::new(pl.to_vec()).unwrap()
                 } else {
                     println!("{:3$}{:?} fetched nothing in {:.02?}",
                         "", word, before.elapsed(), depth * 2);
-                    HashSet::new()
+                    SetBuf::default()
                 }
             },
             Query::Phrase(words) => {
                 println!("{:2$}{:?} skipped", "", words, depth * 2);
-                HashSet::new()
+                SetBuf::default()
             },
         }
     }

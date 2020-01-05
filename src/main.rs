@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{HashMap, BTreeSet};
 use std::time::Instant;
 use std::{cmp, fmt};
@@ -5,7 +6,7 @@ use std::{cmp, fmt};
 use big_s::S;
 use maplit::hashmap;
 use rand::{Rng, SeedableRng, rngs::StdRng};
-use sdset::{SetBuf, SetOperation};
+use sdset::{Set, SetBuf, SetOperation};
 use slice_group_by::StrGroupBy;
 
 enum Operation {
@@ -34,34 +35,43 @@ impl fmt::Debug for Operation {
     }
 }
 
-#[derive(Debug)]
+type QueryId = usize;
+
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum Query {
-    Tolerant(String),
-    Exact(String),
-    Prefix(String),
-    Phrase(Vec<String>),
+    Tolerant(QueryId, String),
+    Exact(QueryId, String),
+    Prefix(QueryId, String),
+    Phrase(QueryId, Vec<String>),
 }
 
 impl Query {
-    fn tolerant(s: &str) -> Query {
-        Query::Tolerant(s.to_string())
+    fn tolerant(id: QueryId, s: &str) -> Query {
+        Query::Tolerant(id, s.to_string())
     }
 
-    fn prefix(s: &str) -> Query {
-        Query::Prefix(s.to_string())
+    fn prefix(id: QueryId, s: &str) -> Query {
+        Query::Prefix(id, s.to_string())
     }
 
-    fn phrase2((left, right): (&str, &str)) -> Query {
-        Query::Phrase(vec![left.to_owned(), right.to_owned()])
+    fn phrase2(id: QueryId, (left, right): (&str, &str)) -> Query {
+        Query::Phrase(id, vec![left.to_owned(), right.to_owned()])
     }
 }
 
 type DocId = u16;
+type Position = u8;
+
+#[derive(Debug, Default)]
+struct PostingsList {
+    docids: SetBuf<DocId>,
+    matches: SetBuf<(DocId, Position)>,
+}
 
 #[derive(Debug, Default)]
 struct Context {
     synonyms: HashMap<String, Vec<Vec<String>>>,
-    postings: HashMap<String, Vec<DocId>>,
+    postings: HashMap<String, PostingsList>,
 }
 
 fn split_best_frequency<'a>(ctx: &Context, word: &'a str) -> Option<(&'a str, &'a str)> {
@@ -71,8 +81,8 @@ fn split_best_frequency<'a>(ctx: &Context, word: &'a str) -> Option<(&'a str, &'
     for (i, _) in chars {
         let (left, right) = word.split_at(i);
 
-        let left_freq = ctx.postings.get(left).map(Vec::len).unwrap_or(0);
-        let right_freq = ctx.postings.get(right).map(Vec::len).unwrap_or(0);
+        let left_freq = ctx.postings.get(left).map(|b| b.docids.len()).unwrap_or(0);
+        let right_freq = ctx.postings.get(right).map(|b| b.docids.len()).unwrap_or(0);
 
         let min_freq = cmp::min(left_freq, right_freq);
         if min_freq != 0 && best.map_or(true, |(old, _, _)| min_freq > old) {
@@ -156,17 +166,17 @@ fn create_query_tree(ctx: &Context, query: &str) -> Operation {
         for words in words {
 
             match words {
-                [(_, (is_last, word))] => {
-                    let phrase = split_best_frequency(ctx, word).map(Query::phrase2).map(Operation::Query);
+                [(id, (is_last, word))] => {
+                    let phrase = split_best_frequency(ctx, word).map(|ws| Query::phrase2(*id, ws)).map(Operation::Query);
                     let synonyms = synonyms(ctx, word).into_iter().map(|alts| {
-                        let iter = alts.into_iter().map(Query::Exact).map(Operation::Query);
+                        let iter = alts.into_iter().map(|w| Query::Exact(*id, w)).map(Operation::Query);
                         create_operation(iter, Operation::And)
                     });
 
                     let original = if *is_last {
-                        Query::prefix(word)
+                        Query::prefix(*id, word)
                     } else {
-                        Query::tolerant(word)
+                        Query::tolerant(*id, word)
                     };
 
                     let mut alternatives: Vec<_> = synonyms.chain(phrase).collect();
@@ -179,8 +189,9 @@ fn create_query_tree(ctx: &Context, query: &str) -> Operation {
                     }
                 },
                 words => {
+                    let id = words[0].0;
                     let concat = words.iter().map(|(_, (_, s))| *s).collect();
-                    ops.push(Operation::Query(Query::Exact(concat)));
+                    ops.push(Operation::Query(Query::Exact(id, concat)));
                 }
             }
         }
@@ -192,12 +203,18 @@ fn create_query_tree(ctx: &Context, query: &str) -> Operation {
     create_operation(ands, Operation::And)
 }
 
-fn traverse_query_tree(ctx: &Context, tree: &Operation) -> SetBuf<DocId> {
+struct QueryResult<'q, 'c> {
+    docids: Cow<'c, Set<DocId>>,
+    queries: HashMap<&'q Query, &'c Set<(DocId, Position)>>,
+}
 
-    fn execute_and(ctx: &Context, depth: usize, operations: &[Operation]) -> SetBuf<DocId> {
+fn traverse_query_tree<'a, 'c>(ctx: &'c Context, tree: &'a Operation) -> QueryResult<'a, 'c> {
+
+    fn execute_and<'a, 'c>(ctx: &'c Context, depth: usize, operations: &'a [Operation]) -> QueryResult<'a, 'c> {
         println!("{:1$}AND", "", depth * 2);
 
         let before = Instant::now();
+        let mut queries = HashMap::new();
         let mut results = Vec::new();
 
         for op in operations {
@@ -207,23 +224,26 @@ fn traverse_query_tree(ctx: &Context, tree: &Operation) -> SetBuf<DocId> {
                 Operation::Query(query) => execute_query(ctx, depth + 1, &query),
             };
 
-            results.push(result);
+            results.push(result.docids);
+            queries.extend(result.queries);
         }
 
-        let results = results.iter().map(|s| s.as_set()).collect();
+        let results = results.iter().map(AsRef::as_ref).collect();
         let op = sdset::multi::Intersection::new(results);
-        let ids = op.into_set_buf();
+        let docids = op.into_set_buf();
+        let docids: Cow<Set<_>> = Cow::Owned(docids);
 
         println!("{:3$}--- AND fetched {} documents in {:.02?}",
-            "", ids.len(), before.elapsed(), depth * 2);
+            "", docids.len(), before.elapsed(), depth * 2);
 
-        ids
+        QueryResult { docids, queries }
     }
 
-    fn execute_or(ctx: &Context, depth: usize, operations: &[Operation]) -> SetBuf<DocId> {
+    fn execute_or<'a, 'c>(ctx: &'c Context, depth: usize, operations: &'a [Operation]) -> QueryResult<'a, 'c> {
         println!("{:1$}OR", "", depth * 2);
 
         let before = Instant::now();
+        let mut queries = HashMap::new();
         let mut ids = Vec::new();
 
         for op in operations {
@@ -233,36 +253,41 @@ fn traverse_query_tree(ctx: &Context, tree: &Operation) -> SetBuf<DocId> {
                 Operation::Query(query) => execute_query(ctx, depth + 1, &query),
             };
 
-            ids.extend(result);
+            ids.extend(result.docids.as_ref());
+            queries.extend(result.queries);
         }
 
-        let ids = SetBuf::from_dirty(ids);
+        let docids = SetBuf::from_dirty(ids);
+        let docids: Cow<Set<_>> = Cow::Owned(docids);
 
         println!("{:3$}--- OR fetched {} documents in {:.02?}",
-            "", ids.len(), before.elapsed(), depth * 2);
+            "", docids.len(), before.elapsed(), depth * 2);
 
-        ids
+        QueryResult { docids, queries }
     }
 
-    fn execute_query(ctx: &Context, depth: usize, query: &Query) -> SetBuf<DocId> {
-        match query {
-            Query::Tolerant(word) | Query::Exact(word) | Query::Prefix(word) => {
-                let before = Instant::now();
-
-                if let Some(pl) = ctx.postings.get(word) {
-                    println!("{:4$}{:?} fetched {:?} documents in {:.02?}",
-                        "", word, pl.len(), before.elapsed(), depth * 2);
-                    SetBuf::new(pl.to_vec()).unwrap()
+    fn execute_query<'a, 'c>(ctx: &'c Context, depth: usize, query: &'a Query) -> QueryResult<'a, 'c> {
+        let before = Instant::now();
+        let (docids, matches) = match query {
+            Query::Tolerant(_, word) | Query::Exact(_, word) | Query::Prefix(_, word) => {
+                if let Some(PostingsList { docids, matches }) = ctx.postings.get(word) {
+                    (Cow::Borrowed(docids.as_set()), matches.as_set())
                 } else {
-                    println!("{:3$}{:?} fetched nothing in {:.02?}",
-                        "", word, before.elapsed(), depth * 2);
-                    SetBuf::default()
+                    (Cow::default(), Set::new_unchecked(&[]))
                 }
             },
-            Query::Phrase(words) => {
+            Query::Phrase(_, words) => {
                 println!("{:2$}{:?} skipped", "", words, depth * 2);
-                SetBuf::default()
+                (Cow::default(), Set::new_unchecked(&[]))
             },
+        };
+
+        println!("{:4$}{:?} fetched {:?} documents in {:.02?}",
+            "", query, docids.len(), before.elapsed(), depth * 2);
+
+        QueryResult {
+            docids,
+            queries: hashmap!{ query => matches },
         }
     }
 
@@ -273,16 +298,29 @@ fn traverse_query_tree(ctx: &Context, tree: &Operation) -> SetBuf<DocId> {
     }
 }
 
-fn random_docs<R: Rng>(rng: &mut R, len: usize) -> Vec<DocId> {
+fn random_postings<R: Rng>(rng: &mut R, len: usize) -> PostingsList {
     let mut values = BTreeSet::new();
     while values.len() != len {
         values.insert(rng.gen());
     }
-    values.into_iter().collect()
+
+    let docids = values.iter().copied().collect();
+    let docids = SetBuf::new(docids).unwrap();
+
+    let matches = docids.iter().flat_map(|id| -> Vec<(DocId, Position)> {
+        let mut matches = BTreeSet::new();
+        let len = rng.gen_range(1, 10);
+        while matches.len() != len {
+            matches.insert(rng.gen());
+        }
+        matches.into_iter().map(|p| (*id, p)).collect()
+    }).collect();
+
+    PostingsList { docids, matches: SetBuf::new(matches).unwrap() }
 }
 
 fn main() {
-    let mut rng = StdRng::seed_from_u64(42);
+    let mut rng = StdRng::seed_from_u64(102);
     let rng = &mut rng;
 
     let context = Context {
@@ -297,20 +335,20 @@ fn main() {
             ],
         },
         postings: hashmap!{
-            S("hello")      => random_docs(rng,   1500),
-            S("helloworld") => random_docs(rng,    100),
-            S("hi")         => random_docs(rng,   4000),
-            S("hell")       => random_docs(rng,   2500),
-            S("o")          => random_docs(rng,    400),
-            S("worl")       => random_docs(rng,   1400),
-            S("world")      => random_docs(rng, 15_000),
-            S("earth")      => random_docs(rng,   8000),
-            S("2020")       => random_docs(rng,    100),
-            S("2019")       => random_docs(rng,    500),
-            S("is")         => random_docs(rng, 50_000),
-            S("this")       => random_docs(rng, 50_000),
-            S("good")       => random_docs(rng,   1250),
-            S("morning")    => random_docs(rng,    125),
+            S("hello")      => random_postings(rng,   1500),
+            S("helloworld") => random_postings(rng,    100),
+            S("hi")         => random_postings(rng,   4000),
+            S("hell")       => random_postings(rng,   2500),
+            S("o")          => random_postings(rng,    400),
+            S("worl")       => random_postings(rng,   1400),
+            S("world")      => random_postings(rng, 15_000),
+            S("earth")      => random_postings(rng,   8000),
+            S("2020")       => random_postings(rng,    100),
+            S("2019")       => random_postings(rng,    500),
+            S("is")         => random_postings(rng, 50_000),
+            S("this")       => random_postings(rng, 50_000),
+            S("good")       => random_postings(rng,   1250),
+            S("morning")    => random_postings(rng,    125),
         },
     };
 
@@ -321,8 +359,17 @@ fn main() {
 
     println!("---------------------------------\n");
 
-    let docids = traverse_query_tree(&context, &query_tree);
-
+    let QueryResult { docids, queries } = traverse_query_tree(&context, &query_tree);
     println!("found {} documents", docids.len());
-    println!("{:?}", docids);
+
+    let before = Instant::now();
+    for (query, matches) in queries {
+        let op = sdset::duo::IntersectionByKey::new(matches, &docids, |m| m.0, Clone::clone);
+        let buf: SetBuf<(u16, u8)> = op.into_set_buf();
+        if !buf.is_empty() {
+            println!("{:?} gives {} matches", query, buf.len());
+        }
+    }
+
+    println!("matches cleaned in {:.02?}", before.elapsed());
 }

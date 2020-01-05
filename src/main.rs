@@ -1,4 +1,3 @@
-use std::borrow::Cow;
 use std::collections::{HashMap, BTreeSet};
 use std::time::Instant;
 use std::{cmp, fmt};
@@ -7,7 +6,7 @@ use big_s::S;
 use maplit::hashmap;
 use rand::{Rng, SeedableRng, rngs::StdRng};
 use sdset::{Set, SetBuf, SetOperation};
-use slice_group_by::StrGroupBy;
+use slice_group_by::{StrGroupBy, GroupBy};
 
 enum Operation {
     And(Vec<Operation>),
@@ -63,15 +62,9 @@ type DocId = u16;
 type Position = u8;
 
 #[derive(Debug, Default)]
-struct PostingsList {
-    docids: SetBuf<DocId>,
-    matches: SetBuf<(DocId, Position)>,
-}
-
-#[derive(Debug, Default)]
 struct Context {
     synonyms: HashMap<String, Vec<Vec<String>>>,
-    postings: HashMap<String, PostingsList>,
+    postings: HashMap<String, SetBuf<(DocId, Position)>>,
 }
 
 fn split_best_frequency<'a>(ctx: &Context, word: &'a str) -> Option<(&'a str, &'a str)> {
@@ -81,8 +74,8 @@ fn split_best_frequency<'a>(ctx: &Context, word: &'a str) -> Option<(&'a str, &'
     for (i, _) in chars {
         let (left, right) = word.split_at(i);
 
-        let left_freq = ctx.postings.get(left).map(|b| b.docids.len()).unwrap_or(0);
-        let right_freq = ctx.postings.get(right).map(|b| b.docids.len()).unwrap_or(0);
+        let left_freq = ctx.postings.get(left).map(|b| b.len()).unwrap_or(0);
+        let right_freq = ctx.postings.get(right).map(|b| b.len()).unwrap_or(0);
 
         let min_freq = cmp::min(left_freq, right_freq);
         if min_freq != 0 && best.map_or(true, |(old, _, _)| min_freq > old) {
@@ -204,7 +197,7 @@ fn create_query_tree(ctx: &Context, query: &str) -> Operation {
 }
 
 struct QueryResult<'q, 'c> {
-    docids: Cow<'c, Set<DocId>>,
+    docids: SetBuf<DocId>,
     queries: HashMap<&'q Query, &'c Set<(DocId, Position)>>,
 }
 
@@ -231,7 +224,6 @@ fn traverse_query_tree<'a, 'c>(ctx: &'c Context, tree: &'a Operation) -> QueryRe
         let results = results.iter().map(AsRef::as_ref).collect();
         let op = sdset::multi::Intersection::new(results);
         let docids = op.into_set_buf();
-        let docids: Cow<Set<_>> = Cow::Owned(docids);
 
         println!("{:3$}--- AND fetched {} documents in {:.02?}",
             "", docids.len(), before.elapsed(), depth * 2);
@@ -253,12 +245,11 @@ fn traverse_query_tree<'a, 'c>(ctx: &'c Context, tree: &'a Operation) -> QueryRe
                 Operation::Query(query) => execute_query(ctx, depth + 1, &query),
             };
 
-            ids.extend(result.docids.as_ref());
+            ids.extend_from_slice(result.docids.as_ref());
             queries.extend(result.queries);
         }
 
         let docids = SetBuf::from_dirty(ids);
-        let docids: Cow<Set<_>> = Cow::Owned(docids);
 
         println!("{:3$}--- OR fetched {} documents in {:.02?}",
             "", docids.len(), before.elapsed(), depth * 2);
@@ -270,15 +261,16 @@ fn traverse_query_tree<'a, 'c>(ctx: &'c Context, tree: &'a Operation) -> QueryRe
         let before = Instant::now();
         let (docids, matches) = match query {
             Query::Tolerant(_, word) | Query::Exact(_, word) | Query::Prefix(_, word) => {
-                if let Some(PostingsList { docids, matches }) = ctx.postings.get(word) {
-                    (Cow::Borrowed(docids.as_set()), matches.as_set())
+                if let Some(matches) = ctx.postings.get(word) {
+                    let docids = matches.linear_group_by_key(|m| m.0).map(|g| g[0].0).collect();
+                    (SetBuf::new(docids).unwrap(), matches.as_set())
                 } else {
-                    (Cow::default(), Set::new_unchecked(&[]))
+                    (SetBuf::default(), Set::new_unchecked(&[]))
                 }
             },
             Query::Phrase(_, words) => {
                 println!("{:2$}{:?} skipped", "", words, depth * 2);
-                (Cow::default(), Set::new_unchecked(&[]))
+                (SetBuf::default(), Set::new_unchecked(&[]))
             },
         };
 
@@ -298,16 +290,13 @@ fn traverse_query_tree<'a, 'c>(ctx: &'c Context, tree: &'a Operation) -> QueryRe
     }
 }
 
-fn random_postings<R: Rng>(rng: &mut R, len: usize) -> PostingsList {
+fn random_postings<R: Rng>(rng: &mut R, len: usize) -> SetBuf<(DocId, Position)> {
     let mut values = BTreeSet::new();
     while values.len() != len {
         values.insert(rng.gen());
     }
 
-    let docids = values.iter().copied().collect();
-    let docids = SetBuf::new(docids).unwrap();
-
-    let matches = docids.iter().flat_map(|id| -> Vec<(DocId, Position)> {
+    let matches = values.iter().flat_map(|id| -> Vec<(DocId, Position)> {
         let mut matches = BTreeSet::new();
         let len = rng.gen_range(1, 10);
         while matches.len() != len {
@@ -316,7 +305,7 @@ fn random_postings<R: Rng>(rng: &mut R, len: usize) -> PostingsList {
         matches.into_iter().map(|p| (*id, p)).collect()
     }).collect();
 
-    PostingsList { docids, matches: SetBuf::new(matches).unwrap() }
+    SetBuf::new(matches).unwrap()
 }
 
 fn main() {

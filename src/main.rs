@@ -1,12 +1,14 @@
+use std::borrow::Cow;
 use std::collections::{HashMap, BTreeSet};
 use std::time::Instant;
-use std::{cmp, fmt};
+use std::{cmp, fmt, iter::once};
 
 use big_s::S;
 use maplit::hashmap;
 use rand::{Rng, SeedableRng, rngs::StdRng};
 use sdset::{Set, SetBuf, SetOperation};
 use slice_group_by::{StrGroupBy, GroupBy};
+use itertools::{EitherOrBoth, merge_join_by};
 
 enum Operation {
     And(Vec<Operation>),
@@ -198,7 +200,9 @@ fn create_query_tree(ctx: &Context, query: &str) -> Operation {
 
 struct QueryResult<'q, 'c> {
     docids: SetBuf<DocId>,
-    queries: HashMap<&'q Query, &'c Set<(DocId, Position)>>,
+    // TODO: use an HashSet with an enum with the
+    //       corresponding matches for every word
+    queries: HashMap<&'q Query, Cow<'c, Set<(DocId, Position)>>>,
 }
 
 fn traverse_query_tree<'a, 'c>(ctx: &'c Context, tree: &'a Operation) -> QueryResult<'a, 'c> {
@@ -263,14 +267,36 @@ fn traverse_query_tree<'a, 'c>(ctx: &'c Context, tree: &'a Operation) -> QueryRe
             Query::Tolerant(_, word) | Query::Exact(_, word) | Query::Prefix(_, word) => {
                 if let Some(matches) = ctx.postings.get(word) {
                     let docids = matches.linear_group_by_key(|m| m.0).map(|g| g[0].0).collect();
-                    (SetBuf::new(docids).unwrap(), matches.as_set())
+                    (SetBuf::new(docids).unwrap(), Cow::Borrowed(matches.as_set()))
                 } else {
-                    (SetBuf::default(), Set::new_unchecked(&[]))
+                    (SetBuf::default(), Cow::default())
                 }
             },
             Query::Phrase(_, words) => {
-                println!("{:2$}{:?} skipped", "", words, depth * 2);
-                (SetBuf::default(), Set::new_unchecked(&[]))
+                if let [first, second] = words.as_slice() {
+                    let default = SetBuf::default();
+                    let first = ctx.postings.get(first).unwrap_or(&default);
+                    let second = ctx.postings.get(second).unwrap_or(&default);
+
+                    let iter = merge_join_by(first.as_slice(), second.as_slice(), |a, b| {
+                        (a.0, a.1 + 1).cmp(&(b.0, b.1))
+                    });
+
+                    let matches: Vec<_> = iter
+                        .filter_map(EitherOrBoth::both)
+                        .flat_map(|(a, b)| once(*a).chain(Some(*b)))
+                        .collect();
+
+                    let mut docids: Vec<_> = matches.iter().map(|m| m.0).collect();
+                    docids.dedup();
+
+                    println!("{:2$}matches {:?}", "", matches, depth * 2);
+
+                    (SetBuf::new(docids).unwrap(), Cow::Owned(SetBuf::new(matches).unwrap()))
+                } else {
+                    println!("{:2$}{:?} skipped", "", words, depth * 2);
+                    (SetBuf::default(), Cow::default())
+                }
             },
         };
 
@@ -353,7 +379,7 @@ fn main() {
 
     let before = Instant::now();
     for (query, matches) in queries {
-        let op = sdset::duo::IntersectionByKey::new(matches, &docids, |m| m.0, Clone::clone);
+        let op = sdset::duo::IntersectionByKey::new(&matches, &docids, |m| m.0, Clone::clone);
         let buf: SetBuf<(u16, u8)> = op.into_set_buf();
         if !buf.is_empty() {
             println!("{:?} gives {} matches", query, buf.len());

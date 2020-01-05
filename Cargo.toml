@@ -6,10 +6,11 @@ authors = ["Clément Renault <renault.cle@gmail.com>"]
 edition = "2018"
 
 [dependencies]
-maplit = "1.0.2"
 big_s = "1.0.2"
-slice-group-by = "0.2.6"
+itertools = "0.8.2"
+maplit = "1.0.2"
 rand = "0.7.2"
+slice-group-by = "0.2.6"
 
 [dependencies.sdset]
 version = "0.3.6"

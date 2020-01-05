@@ -148,16 +148,17 @@ fn create_query_tree(ctx: &Context, query: &str) -> Operation {
     let query = query.to_lowercase();
 
     let words = query.linear_group_by_key(char::is_whitespace);
-    let words: Vec<_> = is_last(words).filter(|(_, s)| !s.contains(char::is_whitespace)).collect();
+    let words = is_last(words).filter(|(_, s)| !s.contains(char::is_whitespace)).enumerate();
+    let words: Vec<_> = words.collect();
 
     let mut ands = Vec::new();
-    for words in group_by(ngram_slice(MAX_NGRAM, &words), |a, b| a[0].1 == b[0].1) {
+    for words in group_by(ngram_slice(MAX_NGRAM, &words), |a, b| a[0].0 == b[0].0) {
 
         let mut ops = Vec::new();
         for words in words {
 
             match words {
-                [(is_last, word)] => {
+                [(_, (is_last, word))] => {
                     let phrase = split_best_frequency(ctx, word).map(Query::phrase2).map(Operation::Query);
                     let synonyms = synonyms(ctx, word).into_iter().map(|alts| {
                         let iter = alts.into_iter().map(Query::Exact).map(Operation::Query);
@@ -180,7 +181,7 @@ fn create_query_tree(ctx: &Context, query: &str) -> Operation {
                     }
                 },
                 words => {
-                    let concat = words.iter().map(|(_, s)| *s).collect();
+                    let concat = words.iter().map(|(_, (_, s))| *s).collect();
                     ops.push(Operation::Query(Query::Exact(concat)));
                 }
             }

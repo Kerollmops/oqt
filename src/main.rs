@@ -279,7 +279,7 @@ fn traverse_query_tree<'a, 'c>(ctx: &'c Context, tree: &'a Operation) -> QueryRe
                     let second = ctx.postings.get(second).unwrap_or(&default);
 
                     let iter = merge_join_by(first.as_slice(), second.as_slice(), |a, b| {
-                        (a.0, a.1 + 1).cmp(&(b.0, b.1))
+                        (a.0, (a.1 as u32) + 1).cmp(&(b.0, b.1 as u32))
                     });
 
                     let matches: Vec<_> = iter

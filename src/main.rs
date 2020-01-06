@@ -7,7 +7,7 @@ use big_s::S;
 use maplit::hashmap;
 use rand::{Rng, SeedableRng, rngs::StdRng};
 use sdset::{Set, SetBuf, SetOperation};
-use slice_group_by::{StrGroupBy, GroupBy};
+use slice_group_by::StrGroupBy;
 use itertools::{EitherOrBoth, merge_join_by};
 
 enum Operation {
@@ -64,9 +64,15 @@ type DocId = u16;
 type Position = u8;
 
 #[derive(Debug, Default)]
+struct PostingsList {
+    docids: SetBuf<DocId>,
+    matches: SetBuf<(DocId, Position)>,
+}
+
+#[derive(Debug, Default)]
 struct Context {
     synonyms: HashMap<String, Vec<Vec<String>>>,
-    postings: HashMap<String, SetBuf<(DocId, Position)>>,
+    postings: HashMap<String, PostingsList>,
 }
 
 fn split_best_frequency<'a>(ctx: &Context, word: &'a str) -> Option<(&'a str, &'a str)> {
@@ -76,8 +82,8 @@ fn split_best_frequency<'a>(ctx: &Context, word: &'a str) -> Option<(&'a str, &'
     for (i, _) in chars {
         let (left, right) = word.split_at(i);
 
-        let left_freq = ctx.postings.get(left).map(|b| b.len()).unwrap_or(0);
-        let right_freq = ctx.postings.get(right).map(|b| b.len()).unwrap_or(0);
+        let left_freq = ctx.postings.get(left).map(|b| b.docids.len()).unwrap_or(0);
+        let right_freq = ctx.postings.get(right).map(|b| b.docids.len()).unwrap_or(0);
 
         let min_freq = cmp::min(left_freq, right_freq);
         if min_freq != 0 && best.map_or(true, |(old, _, _)| min_freq > old) {
@@ -174,9 +180,7 @@ fn create_query_tree(ctx: &Context, query: &str) -> Operation {
 }
 
 struct QueryResult<'q, 'c> {
-    docids: SetBuf<DocId>,
-    // TODO: use an HashSet with an enum with the
-    //       corresponding matches for every word
+    docids: Cow<'c, Set<DocId>>,
     queries: HashMap<&'q Query, Cow<'c, Set<(DocId, Position)>>>,
 }
 
@@ -203,6 +207,7 @@ fn traverse_query_tree<'a, 'c>(ctx: &'c Context, tree: &'a Operation) -> QueryRe
         let results = results.iter().map(AsRef::as_ref).collect();
         let op = sdset::multi::Intersection::new(results);
         let docids = op.into_set_buf();
+        let docids: Cow<Set<_>> = Cow::Owned(docids);
 
         println!("{:3$}--- AND fetched {} documents in {:.02?}",
             "", docids.len(), before.elapsed(), depth * 2);
@@ -224,11 +229,12 @@ fn traverse_query_tree<'a, 'c>(ctx: &'c Context, tree: &'a Operation) -> QueryRe
                 Operation::Query(query) => execute_query(ctx, depth + 1, &query),
             };
 
-            ids.extend_from_slice(result.docids.as_ref());
+            ids.extend(result.docids.as_ref());
             queries.extend(result.queries);
         }
 
         let docids = SetBuf::from_dirty(ids);
+        let docids: Cow<Set<_>> = Cow::Owned(docids);
 
         println!("{:3$}--- OR fetched {} documents in {:.02?}",
             "", docids.len(), before.elapsed(), depth * 2);
@@ -240,18 +246,17 @@ fn traverse_query_tree<'a, 'c>(ctx: &'c Context, tree: &'a Operation) -> QueryRe
         let before = Instant::now();
         let (docids, matches) = match query {
             Query::Tolerant(_, word) | Query::Exact(_, word) | Query::Prefix(_, word) => {
-                if let Some(matches) = ctx.postings.get(word) {
-                    let docids = matches.linear_group_by_key(|m| m.0).map(|g| g[0].0).collect();
-                    (SetBuf::new(docids).unwrap(), Cow::Borrowed(matches.as_set()))
+                if let Some(PostingsList { docids, matches }) = ctx.postings.get(word) {
+                    (Cow::Borrowed(docids.as_set()), Cow::Borrowed(matches.as_set()))
                 } else {
-                    (SetBuf::default(), Cow::default())
+                    (Cow::default(), Cow::default())
                 }
             },
             Query::Phrase(_, words) => {
                 if let [first, second] = words.as_slice() {
                     let default = SetBuf::default();
-                    let first = ctx.postings.get(first).unwrap_or(&default);
-                    let second = ctx.postings.get(second).unwrap_or(&default);
+                    let first = ctx.postings.get(first).map(|pl| &pl.matches).unwrap_or(&default);
+                    let second = ctx.postings.get(second).map(|pl| &pl.matches).unwrap_or(&default);
 
                     let iter = merge_join_by(first.as_slice(), second.as_slice(), |a, b| {
                         (a.0, (a.1 as u32) + 1).cmp(&(b.0, b.1 as u32))
@@ -267,10 +272,10 @@ fn traverse_query_tree<'a, 'c>(ctx: &'c Context, tree: &'a Operation) -> QueryRe
 
                     println!("{:2$}matches {:?}", "", matches, depth * 2);
 
-                    (SetBuf::new(docids).unwrap(), Cow::Owned(SetBuf::new(matches).unwrap()))
+                    (Cow::Owned(SetBuf::new(docids).unwrap()), Cow::Owned(SetBuf::new(matches).unwrap()))
                 } else {
                     println!("{:2$}{:?} skipped", "", words, depth * 2);
-                    (SetBuf::default(), Cow::default())
+                    (Cow::default(), Cow::default())
                 }
             },
         };
@@ -291,13 +296,16 @@ fn traverse_query_tree<'a, 'c>(ctx: &'c Context, tree: &'a Operation) -> QueryRe
     }
 }
 
-fn random_postings<R: Rng>(rng: &mut R, len: usize) -> SetBuf<(DocId, Position)> {
+fn random_postings<R: Rng>(rng: &mut R, len: usize) -> PostingsList {
     let mut values = BTreeSet::new();
     while values.len() != len {
         values.insert(rng.gen());
     }
 
-    let matches = values.iter().flat_map(|id| -> Vec<(DocId, Position)> {
+    let docids = values.iter().copied().collect();
+    let docids = SetBuf::new(docids).unwrap();
+
+    let matches = docids.iter().flat_map(|id| -> Vec<(DocId, Position)> {
         let mut matches = BTreeSet::new();
         let len = rng.gen_range(1, 10);
         while matches.len() != len {
@@ -306,7 +314,7 @@ fn random_postings<R: Rng>(rng: &mut R, len: usize) -> SetBuf<(DocId, Position)>
         matches.into_iter().map(|p| (*id, p)).collect()
     }).collect();
 
-    SetBuf::new(matches).unwrap()
+    PostingsList { docids, matches: SetBuf::new(matches).unwrap() }
 }
 
 fn main() {

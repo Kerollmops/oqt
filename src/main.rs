@@ -10,6 +10,7 @@ use sdset::{Set, SetBuf, SetOperation};
 use slice_group_by::StrGroupBy;
 use itertools::{EitherOrBoth, merge_join_by};
 
+#[derive(PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum Operation {
     And(Vec<Operation>),
     Or(Vec<Operation>),
@@ -184,65 +185,94 @@ struct QueryResult<'q, 'c> {
     queries: HashMap<&'q Query, Cow<'c, Set<(DocId, Position)>>>,
 }
 
+type Postings<'q, 'c> = HashMap<&'q Query, Cow<'c, Set<(DocId, Position)>>>;
+type Cache<'o, 'c> = HashMap<&'o Operation, Cow<'c, Set<DocId>>>;
+
 fn traverse_query_tree<'a, 'c>(ctx: &'c Context, tree: &'a Operation) -> QueryResult<'a, 'c> {
 
-    fn execute_and<'a, 'c>(ctx: &'c Context, depth: usize, operations: &'a [Operation]) -> QueryResult<'a, 'c> {
+    fn execute_and<'o, 'c>(
+        ctx: &'c Context,
+        cache: &mut Cache<'o, 'c>,
+        postings: &mut Postings<'o, 'c>,
+        depth: usize,
+        operations: &'o [Operation],
+    ) -> Cow<'c, Set<DocId>>
+    {
         println!("{:1$}AND", "", depth * 2);
 
         let before = Instant::now();
-        let mut queries = HashMap::new();
         let mut results = Vec::new();
 
         for op in operations {
-            let result = match op {
-                Operation::And(operations) => execute_and(ctx, depth + 1, &operations),
-                Operation::Or(operations) => execute_or(ctx, depth + 1, &operations),
-                Operation::Query(query) => execute_query(ctx, depth + 1, &query),
-            };
-
-            results.push(result.docids);
-            queries.extend(result.queries);
+            if cache.get(op).is_none() {
+                let docids = match op {
+                    Operation::And(ops) => execute_and(ctx, cache, postings, depth + 1, &ops),
+                    Operation::Or(ops) => execute_or(ctx, cache, postings, depth + 1, &ops),
+                    Operation::Query(query) => execute_query(ctx, postings, depth + 1, &query),
+                };
+                cache.insert(op, docids);
+            }
         }
 
-        let results = results.iter().map(AsRef::as_ref).collect();
+        for op in operations {
+            if let Some(docids) = cache.get(op) {
+                results.push(docids.as_ref());
+            }
+        }
+
         let op = sdset::multi::Intersection::new(results);
         let docids = op.into_set_buf();
         let docids: Cow<Set<_>> = Cow::Owned(docids);
 
-        println!("{:3$}--- AND fetched {} documents in {:.02?}",
-            "", docids.len(), before.elapsed(), depth * 2);
+        println!("{:3$}--- AND fetched {} documents in {:.02?}", "", docids.len(), before.elapsed(), depth * 2);
 
-        QueryResult { docids, queries }
+        docids
     }
 
-    fn execute_or<'a, 'c>(ctx: &'c Context, depth: usize, operations: &'a [Operation]) -> QueryResult<'a, 'c> {
+    fn execute_or<'o, 'c>(
+        ctx: &'c Context,
+        cache: &mut Cache<'o, 'c>,
+        postings: &mut Postings<'o, 'c>,
+        depth: usize,
+        operations: &'o [Operation],
+    ) -> Cow<'c, Set<DocId>>
+    {
         println!("{:1$}OR", "", depth * 2);
 
         let before = Instant::now();
-        let mut queries = HashMap::new();
         let mut ids = Vec::new();
 
         for op in operations {
-            let result = match op {
-                Operation::And(operations) => execute_and(ctx, depth + 1, &operations),
-                Operation::Or(operations) => execute_or(ctx, depth + 1, &operations),
-                Operation::Query(query) => execute_query(ctx, depth + 1, &query),
+            let docids = match cache.get(op) {
+                Some(docids) => docids,
+                None => {
+                    let docids = match op {
+                        Operation::And(ops) => execute_and(ctx, cache, postings, depth + 1, &ops),
+                        Operation::Or(ops) => execute_or(ctx, cache, postings, depth + 1, &ops),
+                        Operation::Query(query) => execute_query(ctx, postings, depth + 1, &query),
+                    };
+                    cache.entry(op).or_insert(docids)
+                }
             };
 
-            ids.extend(result.docids.as_ref());
-            queries.extend(result.queries);
+            ids.extend(docids.as_ref());
         }
 
         let docids = SetBuf::from_dirty(ids);
         let docids: Cow<Set<_>> = Cow::Owned(docids);
 
-        println!("{:3$}--- OR fetched {} documents in {:.02?}",
-            "", docids.len(), before.elapsed(), depth * 2);
+        println!("{:3$}--- OR fetched {} documents in {:.02?}", "", docids.len(), before.elapsed(), depth * 2);
 
-        QueryResult { docids, queries }
+        docids
     }
 
-    fn execute_query<'a, 'c>(ctx: &'c Context, depth: usize, query: &'a Query) -> QueryResult<'a, 'c> {
+    fn execute_query<'o, 'c>(
+        ctx: &'c Context,
+        postings: &mut Postings<'o, 'c>,
+        depth: usize,
+        query: &'o Query,
+    ) -> Cow<'c, Set<DocId>>
+    {
         let before = Instant::now();
         let (docids, matches) = match query {
             Query::Tolerant(_, word) | Query::Exact(_, word) | Query::Prefix(_, word) => {
@@ -280,20 +310,22 @@ fn traverse_query_tree<'a, 'c>(ctx: &'c Context, tree: &'a Operation) -> QueryRe
             },
         };
 
-        println!("{:4$}{:?} fetched {:?} documents in {:.02?}",
-            "", query, docids.len(), before.elapsed(), depth * 2);
+        println!("{:4$}{:?} fetched {:?} documents in {:.02?}", "", query, docids.len(), before.elapsed(), depth * 2);
 
-        QueryResult {
-            docids,
-            queries: hashmap!{ query => matches },
-        }
+        postings.insert(query, matches);
+        docids
     }
 
-    match tree {
-        Operation::And(operations) => execute_and(ctx, 0, &operations),
-        Operation::Or(operations) => execute_or(ctx, 0, &operations),
-        Operation::Query(query) => execute_query(ctx, 0, &query),
-    }
+    let mut cache = Cache::new();
+    let mut postings = Postings::new();
+
+    let docids = match tree {
+        Operation::And(operations) => execute_and(ctx, &mut cache, &mut postings, 0, &operations),
+        Operation::Or(operations) => execute_or(ctx, &mut cache, &mut postings, 0, &operations),
+        Operation::Query(query) => execute_query(ctx, &mut postings, 0, &query),
+    };
+
+    QueryResult { docids, queries: postings }
 }
 
 fn random_postings<R: Rng>(rng: &mut R, len: usize) -> PostingsList {
@@ -359,6 +391,7 @@ fn main() {
 
     let QueryResult { docids, queries } = traverse_query_tree(&context, &query_tree);
     println!("found {} documents", docids.len());
+    println!("number of postings {:?}", queries.len());
 
     let before = Instant::now();
     for (query, matches) in queries {

@@ -99,41 +99,6 @@ fn is_last<I: IntoIterator>(iter: I) -> impl Iterator<Item=(bool, I::Item)> {
     })
 }
 
-fn ngram_slice<T>(ngram: usize, slice: &[T]) -> impl Iterator<Item=&[T]> {
-    (0..slice.len()).flat_map(move |i| {
-        (1..=ngram).into_iter().filter_map(move |n| slice.get(i..i + n))
-    })
-}
-
-fn group_by<I, F>(iter: I, f: F) -> impl Iterator<Item=Vec<I::Item>>
-where I: IntoIterator,
-      F: Fn(&I::Item, &I::Item) -> bool,
-{
-    let mut iter = iter.into_iter();
-    let mut prev = None;
-    core::iter::from_fn(move || {
-        let mut out = Vec::new();
-        loop {
-            match (prev.take().or_else(|| iter.next()), iter.next()) {
-                (Some(a), Some(b)) if f(&a, &b) => {
-                    out.push(a);
-                    prev = Some(b);
-                },
-                (Some(a), Some(b)) => {
-                    out.push(a);
-                    prev = Some(b);
-                    return Some(out);
-                },
-                (Some(a), None) => {
-                    out.push(a);
-                    return Some(out);
-                },
-                (None, _) => return None,
-            }
-        }
-    })
-}
-
 fn create_operation<I, F>(iter: I, f: F) -> Operation
 where I: IntoIterator<Item=Operation>,
       F: Fn(Vec<Operation>) -> Operation,
@@ -150,52 +115,62 @@ const MAX_NGRAM: usize = 3;
 fn create_query_tree(ctx: &Context, query: &str) -> Operation {
     let query = query.to_lowercase();
 
-    let words = query.linear_group_by_key(char::is_whitespace);
-    let words = is_last(words).filter(|(_, s)| !s.contains(char::is_whitespace)).enumerate();
+    let words = query.linear_group_by_key(char::is_whitespace).map(ToOwned::to_owned);
+    let words = words.filter(|s| !s.contains(char::is_whitespace)).enumerate();
     let words: Vec<_> = words.collect();
 
-    let mut ands = Vec::new();
-    for words in group_by(ngram_slice(MAX_NGRAM, &words), |a, b| a[0].0 == b[0].0) {
+    let mut ngrams = Vec::new();
+    for ngram in 1..=MAX_NGRAM {
+        let ngiter = words.windows(ngram).enumerate().map(|(i, g)| {
+            let before = words[..i].windows(1);
+            let after = words[i + ngram..].windows(1);
+            before.chain(Some(g)).chain(after)
+        });
 
-        let mut ops = Vec::new();
-        for words in words {
+        for group in ngiter {
+            let mut ops = Vec::new();
 
-            match words {
-                [(id, (is_last, word))] => {
-                    let phrase = split_best_frequency(ctx, word).map(|ws| Query::phrase2(*id, ws)).map(Operation::Query);
-                    let synonyms = synonyms(ctx, word).into_iter().map(|alts| {
-                        let iter = alts.into_iter().map(|w| Query::Exact(*id, w)).map(Operation::Query);
-                        create_operation(iter, Operation::And)
-                    });
+            for (is_last, words) in is_last(group) {
+                let mut alts = Vec::new();
+                match words {
+                    [(id, word)] => {
+                        let phrase = split_best_frequency(ctx, word).map(|ws| Query::phrase2(*id, ws)).map(Operation::Query);
+                        let synonyms = synonyms(ctx, word).into_iter().map(|alts| {
+                            let iter = alts.into_iter().map(|w| Query::Exact(*id, w)).map(Operation::Query);
+                            create_operation(iter, Operation::And)
+                        });
 
-                    let original = if *is_last {
-                        Query::prefix(*id, word)
-                    } else {
-                        Query::tolerant(*id, word)
-                    };
+                        let original = if is_last {
+                            Query::prefix(*id, word)
+                        } else {
+                            Query::tolerant(*id, word)
+                        };
 
-                    let mut alternatives: Vec<_> = synonyms.chain(phrase).collect();
+                        let mut alternatives: Vec<_> = synonyms.chain(phrase).collect();
 
-                    if !alternatives.is_empty() {
-                        ops.push(Operation::Query(original));
-                        ops.append(&mut alternatives);
-                    } else {
-                        ops.push(Operation::Query(original));
+                        if !alternatives.is_empty() {
+                            alts.push(Operation::Query(original));
+                            alts.append(&mut alternatives);
+                        } else {
+                            alts.push(Operation::Query(original));
+                        }
+                    },
+                    words => {
+                        let id = words[0].0;
+                        let concat = words.iter().map(|(_, s)| s.as_str()).collect();
+                        alts.push(Operation::Query(Query::Exact(id, concat)));
                     }
-                },
-                words => {
-                    let id = words[0].0;
-                    let concat = words.iter().map(|(_, (_, s))| *s).collect();
-                    ops.push(Operation::Query(Query::Exact(id, concat)));
                 }
-            }
-        }
 
-        let ops = create_operation(ops, Operation::Or);
-        ands.push(ops)
+                ops.push(create_operation(alts, Operation::Or));
+            }
+
+            ngrams.push(create_operation(ops, Operation::And));
+            if ngram == 1 { break }
+        }
     }
 
-    create_operation(ands, Operation::And)
+    Operation::Or(ngrams)
 }
 
 struct QueryResult<'q, 'c> {

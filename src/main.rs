@@ -72,7 +72,7 @@ struct PostingsList {
 
 #[derive(Debug, Default)]
 struct Context {
-    synonyms: HashMap<String, Vec<Vec<String>>>,
+    synonyms: HashMap<Vec<String>, Vec<Vec<String>>>,
     postings: HashMap<String, PostingsList>,
 }
 
@@ -95,8 +95,9 @@ fn split_best_frequency<'a>(ctx: &Context, word: &'a str) -> Option<(&'a str, &'
     best.map(|(_, l, r)| (l, r))
 }
 
-fn synonyms(ctx: &Context, word: &str) -> Vec<Vec<String>> {
-    ctx.synonyms.get(word).cloned().unwrap_or_default()
+fn synonyms(ctx: &Context, words: &[&str]) -> Vec<Vec<String>> {
+    let words: Vec<_> = words.iter().map(|s| s.to_string()).collect(); // TODO ugly
+    ctx.synonyms.get(&words).cloned().unwrap_or_default()
 }
 
 fn is_last<I: IntoIterator>(iter: I) -> impl Iterator<Item=(bool, I::Item)> {
@@ -142,7 +143,7 @@ fn create_query_tree(ctx: &Context, query: &str) -> Operation {
                 match words {
                     [(id, word)] => {
                         let phrase = split_best_frequency(ctx, word).map(|ws| Query::phrase2(*id, ws)).map(Operation::Query);
-                        let synonyms = synonyms(ctx, word).into_iter().map(|alts| {
+                        let synonyms = synonyms(ctx, &[word]).into_iter().map(|alts| {
                             let iter = alts.into_iter().map(|w| Query::Exact(*id, w)).map(Operation::Query);
                             create_operation(iter, Operation::And)
                         });
@@ -164,8 +165,21 @@ fn create_query_tree(ctx: &Context, query: &str) -> Operation {
                     },
                     words => {
                         let id = words[0].0;
-                        let concat = words.iter().map(|(_, s)| s.as_str()).collect();
-                        alts.push(Operation::Query(Query::Exact(id, concat)));
+                        let words: Vec<_> = words.iter().map(|(_, s)| s.as_str()).collect();
+
+                        for synonym in synonyms(ctx, &words) {
+                            let synonym = synonym.into_iter().map(|s| Operation::Query(Query::Exact(id, s)));
+                            let synonym = create_operation(synonym, Operation::And);
+                            alts.push(synonym);
+                        }
+
+                        let query = if is_last {
+                            Query::Prefix(id, words.concat())
+                        } else {
+                            Query::Exact(id, words.concat())
+                        };
+
+                        alts.push(Operation::Query(query));
                     }
                 }
 
@@ -355,13 +369,30 @@ fn main() {
 
     let context = Context {
         synonyms: hashmap!{
-            S("hello") => vec![
+            vec![S("hello")] => vec![
                 vec![S("hi")],
                 vec![S("good"), S("morning")],
             ],
-            S("world") => vec![
+            vec![S("world")] => vec![
                 vec![S("earth")],
-                vec![S("nature")]
+                vec![S("nature")],
+            ],
+            vec![S("hello"), S("world")] => vec![
+                vec![S("bonjour"), S("monde")],
+            ],
+
+            // new york city
+            vec![S("nyc")] => vec![
+                vec![S("new"), S("york")],
+                vec![S("new"), S("york"), S("city")],
+            ],
+            vec![S("new"), S("york")] => vec![
+                vec![S("nyc")],
+                vec![S("new"), S("york"), S("city")],
+            ],
+            vec![S("new"), S("york"), S("city")] => vec![
+                vec![S("nyc")],
+                vec![S("new"), S("york")],
             ],
         },
         postings: hashmap!{

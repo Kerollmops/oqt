@@ -129,10 +129,10 @@ fn create_query_tree(ctx: &Context, query: &str) -> Operation {
 
     let mut ngrams = Vec::new();
     for ngram in 1..=MAX_NGRAM {
-        let ngiter = words.windows(ngram).enumerate().map(|(i, g)| {
+        let ngiter = words.windows(ngram).enumerate().map(|(i, group)| {
             let before = words[..i].windows(1);
             let after = words[i + ngram..].windows(1);
-            before.chain(Some(g)).chain(after)
+            before.chain(Some(group)).chain(after)
         });
 
         for group in ngiter {
@@ -148,20 +148,14 @@ fn create_query_tree(ctx: &Context, query: &str) -> Operation {
                             create_operation(iter, Operation::And)
                         });
 
-                        let original = if is_last {
+                        let query = if is_last {
                             Query::prefix(*id, word)
                         } else {
                             Query::tolerant(*id, word)
                         };
 
-                        let mut alternatives: Vec<_> = synonyms.chain(phrase).collect();
-
-                        if !alternatives.is_empty() {
-                            alts.push(Operation::Query(original));
-                            alts.append(&mut alternatives);
-                        } else {
-                            alts.push(Operation::Query(original));
-                        }
+                        alts.push(Operation::Query(query));
+                        alts.extend(synonyms.chain(phrase));
                     },
                     words => {
                         let id = words[0].0;

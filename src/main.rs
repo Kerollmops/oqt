@@ -185,7 +185,7 @@ fn create_query_tree(ctx: &Context, query: &str) -> Operation {
         }
     }
 
-    Operation::Or(ngrams)
+    create_operation(ngrams, Operation::Or)
 }
 
 struct QueryResult<'q, 'c> {

@@ -39,25 +39,49 @@ impl fmt::Debug for Operation {
 
 type QueryId = usize;
 
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-enum Query {
-    Tolerant(QueryId, String),
-    Exact(QueryId, String),
-    Prefix(QueryId, String),
-    Phrase(QueryId, Vec<String>),
+#[derive(PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct Query {
+    id: QueryId,
+    prefix: bool,
+    kind: QueryKind,
+}
+
+#[derive(PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum QueryKind {
+    Tolerant(String),
+    Exact(String),
+    Phrase(Vec<String>),
 }
 
 impl Query {
-    fn tolerant(id: QueryId, s: &str) -> Query {
-        Query::Tolerant(id, s.to_string())
+    fn tolerant(id: QueryId, prefix: bool, s: &str) -> Query {
+        Query { id, prefix, kind: QueryKind::Tolerant(s.to_string()) }
     }
 
-    fn prefix(id: QueryId, s: &str) -> Query {
-        Query::Prefix(id, s.to_string())
+    fn exact(id: QueryId, prefix: bool, s: &str) -> Query {
+        Query { id, prefix, kind: QueryKind::Exact(s.to_string()) }
     }
 
-    fn phrase2(id: QueryId, (left, right): (&str, &str)) -> Query {
-        Query::Phrase(id, vec![left.to_owned(), right.to_owned()])
+    fn phrase2(id: QueryId, prefix: bool, (left, right): (&str, &str)) -> Query {
+        Query { id, prefix, kind: QueryKind::Phrase(vec![left.to_owned(), right.to_owned()]) }
+    }
+}
+
+impl fmt::Debug for Query {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Query { id, prefix, kind } = self;
+        let prefix = if *prefix { String::from("Prefix") } else { String::default() };
+        match kind {
+            QueryKind::Exact(word) => {
+                f.debug_struct(&(prefix + "Exact")).field("id", &id).field("word", &word).finish()
+            },
+            QueryKind::Tolerant(word) => {
+                f.debug_struct(&(prefix + "Tolerant")).field("id", &id).field("word", &word).finish()
+            },
+            QueryKind::Phrase(words) => {
+                f.debug_struct(&(prefix + "Phrase")).field("id", &id).field("words", &words).finish()
+            },
+        }
     }
 }
 
@@ -142,17 +166,16 @@ fn create_query_tree(ctx: &Context, query: &str) -> Operation {
                 let mut alts = Vec::new();
                 match words {
                     [(id, word)] => {
-                        let phrase = split_best_frequency(ctx, word).map(|ws| Query::phrase2(*id, ws)).map(Operation::Query);
+                        let phrase = split_best_frequency(ctx, word)
+                            .map(|ws| Query::phrase2(*id, is_last, ws))
+                            .map(Operation::Query);
+
                         let synonyms = synonyms(ctx, &[word]).into_iter().map(|alts| {
-                            let iter = alts.into_iter().map(|w| Query::Exact(*id, w)).map(Operation::Query);
+                            let iter = alts.into_iter().map(|w| Query::exact(*id, false, &w)).map(Operation::Query);
                             create_operation(iter, Operation::And)
                         });
 
-                        let query = if is_last {
-                            Query::prefix(*id, word)
-                        } else {
-                            Query::tolerant(*id, word)
-                        };
+                        let query = Query::tolerant(*id, is_last, word);
 
                         alts.push(Operation::Query(query));
                         alts.extend(synonyms.chain(phrase));
@@ -162,17 +185,12 @@ fn create_query_tree(ctx: &Context, query: &str) -> Operation {
                         let words: Vec<_> = words.iter().map(|(_, s)| s.as_str()).collect();
 
                         for synonym in synonyms(ctx, &words) {
-                            let synonym = synonym.into_iter().map(|s| Operation::Query(Query::Exact(id, s)));
+                            let synonym = synonym.into_iter().map(|s| Operation::Query(Query::exact(id, false, &s)));
                             let synonym = create_operation(synonym, Operation::And);
                             alts.push(synonym);
                         }
 
-                        let query = if is_last {
-                            Query::Prefix(id, words.concat())
-                        } else {
-                            Query::Exact(id, words.concat())
-                        };
-
+                        let query = Query::exact(id, is_last, &words.concat());
                         alts.push(Operation::Query(query));
                     }
                 }
@@ -282,15 +300,17 @@ fn traverse_query_tree<'a, 'c>(ctx: &'c Context, tree: &'a Operation) -> QueryRe
     ) -> Cow<'c, Set<DocId>>
     {
         let before = Instant::now();
-        let (docids, matches) = match query {
-            Query::Tolerant(_, word) | Query::Exact(_, word) | Query::Prefix(_, word) => {
+
+        let Query { id, prefix, kind } = query;
+        let (docids, matches) = match kind {
+              QueryKind::Tolerant(word) | QueryKind::Exact(word) => {
                 if let Some(PostingsList { docids, matches }) = ctx.postings.get(word) {
                     (Cow::Borrowed(docids.as_set()), Cow::Borrowed(matches.as_set()))
                 } else {
                     (Cow::default(), Cow::default())
                 }
             },
-            Query::Phrase(_, words) => {
+            QueryKind::Phrase(words) => {
                 if let [first, second] = words.as_slice() {
                     let default = SetBuf::default();
                     let first = ctx.postings.get(first).map(|pl| &pl.matches).unwrap_or(&default);

@@ -119,7 +119,7 @@ fn split_best_frequency<'a>(ctx: &Context, word: &'a str) -> Option<(&'a str, &'
     best.map(|(_, l, r)| (l, r))
 }
 
-fn synonyms(ctx: &Context, words: &[&str]) -> Vec<Vec<String>> {
+fn fetch_synonyms(ctx: &Context, words: &[&str]) -> Vec<Vec<String>> {
     let words: Vec<_> = words.iter().map(|s| s.to_string()).collect(); // TODO ugly
     ctx.synonyms.get(&words).cloned().unwrap_or_default()
 }
@@ -170,7 +170,7 @@ fn create_query_tree(ctx: &Context, query: &str) -> Operation {
                             .map(|ws| Query::phrase2(*id, is_last, ws))
                             .map(Operation::Query);
 
-                        let synonyms = synonyms(ctx, &[word]).into_iter().map(|alts| {
+                        let synonyms = fetch_synonyms(ctx, &[word]).into_iter().map(|alts| {
                             let iter = alts.into_iter().map(|w| Query::exact(*id, false, &w)).map(Operation::Query);
                             create_operation(iter, Operation::And)
                         });
@@ -184,7 +184,7 @@ fn create_query_tree(ctx: &Context, query: &str) -> Operation {
                         let id = words[0].0;
                         let words: Vec<_> = words.iter().map(|(_, s)| s.as_str()).collect();
 
-                        for synonym in synonyms(ctx, &words) {
+                        for synonym in fetch_synonyms(ctx, &words) {
                             let synonym = synonym.into_iter().map(|s| Operation::Query(Query::exact(id, false, &s)));
                             let synonym = create_operation(synonym, Operation::And);
                             alts.push(synonym);

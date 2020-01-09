@@ -9,6 +9,9 @@ use rand::{Rng, SeedableRng, rngs::StdRng};
 use sdset::{Set, SetBuf, SetOperation};
 use slice_group_by::StrGroupBy;
 use itertools::{EitherOrBoth, merge_join_by};
+use query_enhancer::{QueryEnhancer, QueryEnhancerBuilder};
+
+mod query_enhancer;
 
 #[derive(PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum Operation {
@@ -146,11 +149,11 @@ const MAX_NGRAM: usize = 3;
 
 fn create_query_tree(ctx: &Context, query: &str) -> Operation {
     let query = query.to_lowercase();
-
     let words = query.linear_group_by_key(char::is_whitespace).map(ToOwned::to_owned);
     let words = words.filter(|s| !s.contains(char::is_whitespace)).enumerate();
     let words: Vec<_> = words.collect();
 
+    let mut index = words.len();
     let mut ngrams = Vec::new();
     for ngram in 1..=MAX_NGRAM {
         let ngiter = words.windows(ngram).enumerate().map(|(i, group)| {
@@ -160,22 +163,25 @@ fn create_query_tree(ctx: &Context, query: &str) -> Operation {
         });
 
         for group in ngiter {
-            let mut ops = Vec::new();
 
+            let mut ops = Vec::new();
             for (is_last, words) in is_last(group) {
+
                 let mut alts = Vec::new();
                 match words {
                     [(id, word)] => {
                         let phrase = split_best_frequency(ctx, word)
-                            .map(|ws| Query::phrase2(*id, is_last, ws))
+                            .map(|ws| Query::phrase2(0, is_last, ws))
                             .map(Operation::Query);
 
                         let synonyms = fetch_synonyms(ctx, &[word]).into_iter().map(|alts| {
-                            let iter = alts.into_iter().map(|w| Query::exact(*id, false, &w)).map(Operation::Query);
+                            let iter = alts.into_iter()
+                                .map(|w| Query::exact(0, false, &w))
+                                .map(Operation::Query);
                             create_operation(iter, Operation::And)
                         });
 
-                        let query = Query::tolerant(*id, is_last, word);
+                        let query = Query::tolerant(0, is_last, word);
 
                         alts.push(Operation::Query(query));
                         alts.extend(synonyms.chain(phrase));
@@ -185,12 +191,14 @@ fn create_query_tree(ctx: &Context, query: &str) -> Operation {
                         let words: Vec<_> = words.iter().map(|(_, s)| s.as_str()).collect();
 
                         for synonym in fetch_synonyms(ctx, &words) {
-                            let synonym = synonym.into_iter().map(|s| Operation::Query(Query::exact(id, false, &s)));
+                            let synonym = synonym.into_iter()
+                                .map(|s| Query::exact(0, false, &s))
+                                .map(Operation::Query);
                             let synonym = create_operation(synonym, Operation::And);
                             alts.push(synonym);
                         }
 
-                        let query = Query::exact(id, is_last, &words.concat());
+                        let query = Query::exact(0, is_last, &words.concat());
                         alts.push(Operation::Query(query));
                     }
                 }
@@ -215,7 +223,6 @@ type Postings<'q, 'c> = HashMap<&'q Query, Cow<'c, Set<(DocId, Position)>>>;
 type Cache<'o, 'c> = HashMap<&'o Operation, Cow<'c, Set<DocId>>>;
 
 fn traverse_query_tree<'a, 'c>(ctx: &'c Context, tree: &'a Operation) -> QueryResult<'a, 'c> {
-
     fn execute_and<'o, 'c>(
         ctx: &'c Context,
         cache: &mut Cache<'o, 'c>,

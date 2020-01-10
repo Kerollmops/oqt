@@ -1,6 +1,8 @@
 use std::borrow::Cow;
-use std::collections::{HashMap, BTreeSet};
+use std::collections::{BTreeMap, HashMap, BTreeSet};
 use std::hash::{Hash, Hasher};
+use std::iter::FromIterator;
+use std::ops::Range;
 use std::time::Instant;
 use std::{cmp, fmt, iter::once};
 
@@ -10,11 +12,11 @@ use rand::{Rng, SeedableRng, rngs::StdRng};
 use sdset::{Set, SetBuf, SetOperation};
 use slice_group_by::StrGroupBy;
 use itertools::{EitherOrBoth, merge_join_by};
-use query_enhancer::{QueryEnhancer, QueryEnhancerBuilder};
+use query_words_mapper::QueryWordsMapper;
 
-mod query_enhancer;
+mod query_words_mapper;
 
-#[derive(PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 enum Operation {
     And(Vec<Operation>),
     Or(Vec<Operation>),
@@ -161,25 +163,27 @@ where I: IntoIterator<Item=Operation>,
 
 const MAX_NGRAM: usize = 3;
 
-fn create_query_tree(ctx: &Context, query: &str) -> Operation {
+fn create_query_tree(ctx: &Context, query: &str) -> (Operation, HashMap<QueryId, Range<usize>>) {
     let query = query.to_lowercase();
     let words = query.linear_group_by_key(char::is_whitespace).map(ToOwned::to_owned);
-    let words = words.filter(|s| !s.contains(char::is_whitespace)).enumerate();
-    let words: Vec<_> = words.collect();
+    let words: Vec<_> = words.filter(|s| !s.contains(char::is_whitespace)).enumerate().collect();
 
+    let mut mapper = QueryWordsMapper::new(words.iter().map(|(_, w)| w));
     let mut ngrams = Vec::new();
     for ngram in 1..=MAX_NGRAM {
 
         let ngiter = words.windows(ngram).enumerate().map(|(i, group)| {
-            let before = words[..i].windows(1);
-            let after = words[i + ngram..].windows(1);
-            before.chain(Some(group)).chain(after)
+            let before = words[0..i].windows(1).enumerate().map(|(i, g)| (i..i+1, g));
+            let after = words[i + ngram..].windows(1)
+                .enumerate()
+                .map(move |(j, g)| (i + j + ngram..i + j + ngram + 1, g));
+            before.chain(Some((i..i + ngram, group))).chain(after)
         });
 
         for group in ngiter {
 
             let mut ops = Vec::new();
-            for (is_last, words) in is_last(group) {
+            for (is_last, (range, words)) in is_last(group) {
 
                 let mut alts = Vec::new();
                 match words {
@@ -189,14 +193,20 @@ fn create_query_tree(ctx: &Context, query: &str) -> Operation {
                         let phrase = split_best_frequency(ctx, word).map(|ws| {
                             let id = idgen.next().unwrap();
                             idgen.next().unwrap();
+                            mapper.declare(range.clone(), id, &[ws.0, ws.1]);
                             Operation::phrase2(id, is_last, ws)
                         });
 
                         let synonyms = fetch_synonyms(ctx, &[word]).into_iter().map(|alts| {
+                            let id = idgen.next().unwrap();
+                            mapper.declare(range.clone(), id, &alts);
+
+                            let mut idgen = once(id).chain(&mut idgen);
                             let iter = alts.into_iter().map(|w| {
                                 let id = idgen.next().unwrap();
                                 Operation::exact(id, false, &w)
                             });
+
                             create_operation(iter, Operation::And)
                         });
 
@@ -212,18 +222,21 @@ fn create_query_tree(ctx: &Context, query: &str) -> Operation {
                         let words: Vec<_> = words.iter().map(|(_, s)| s.as_str()).collect();
 
                         for synonym in fetch_synonyms(ctx, &words) {
+                            let id = idgen.next().unwrap();
+                            mapper.declare(range.clone(), id, &synonym);
+
+                            let mut idgen = once(id).chain(&mut idgen);
                             let synonym = synonym.into_iter().map(|s| {
                                 let id = idgen.next().unwrap();
                                 Operation::exact(id, false, &s)
                             });
-                            let synonym = create_operation(synonym, Operation::And);
-                            alts.push(synonym);
+                            alts.push(create_operation(synonym, Operation::And));
                         }
 
                         let id = idgen.next().unwrap();
-                        let op = Operation::exact(id, is_last, &words.concat());
-
-                        alts.push(op);
+                        let concat = words.concat();
+                        alts.push(Operation::exact(id, is_last, &concat));
+                        mapper.declare(range.clone(), id, &[concat]);
                     }
                 }
 
@@ -235,7 +248,10 @@ fn create_query_tree(ctx: &Context, query: &str) -> Operation {
         }
     }
 
-    create_operation(ngrams, Operation::Or)
+    let mapping = mapper.mapping();
+    let operation = create_operation(ngrams, Operation::Or);
+
+    (operation, mapping)
 }
 
 struct QueryResult<'q, 'c> {
@@ -459,9 +475,10 @@ fn main() {
     };
 
     let query = std::env::args().nth(1).unwrap_or(S("hello world"));
-    let query_tree = create_query_tree(&context, &query);
+    let (query_tree, mapping) = create_query_tree(&context, &query);
 
     println!("{:?}", query_tree);
+    println!("{:#?}", BTreeMap::from_iter(mapping));
 
     println!("---------------------------------\n");
 

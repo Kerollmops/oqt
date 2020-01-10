@@ -40,34 +40,34 @@ impl fmt::Debug for Operation {
     }
 }
 
+impl Operation {
+    fn tolerant(id: QueryId, prefix: bool, s: &str) -> Operation {
+        Operation::Query(Query { id, prefix, kind: QueryKind::Tolerant(s.to_string()) })
+    }
+
+    fn exact(id: QueryId, prefix: bool, s: &str) -> Operation {
+        Operation::Query(Query { id, prefix, kind: QueryKind::Exact(s.to_string()) })
+    }
+
+    fn phrase2(id: QueryId, prefix: bool, (left, right): (&str, &str)) -> Operation {
+        Operation::Query(Query { id, prefix, kind: QueryKind::Phrase(vec![left.to_owned(), right.to_owned()]) })
+    }
+}
+
 type QueryId = usize;
 
-#[derive(PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct Query {
     id: QueryId,
     prefix: bool,
     kind: QueryKind,
 }
 
-#[derive(PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum QueryKind {
     Tolerant(String),
     Exact(String),
     Phrase(Vec<String>),
-}
-
-impl Query {
-    fn tolerant(id: QueryId, prefix: bool, s: &str) -> Query {
-        Query { id, prefix, kind: QueryKind::Tolerant(s.to_string()) }
-    }
-
-    fn exact(id: QueryId, prefix: bool, s: &str) -> Query {
-        Query { id, prefix, kind: QueryKind::Exact(s.to_string()) }
-    }
-
-    fn phrase2(id: QueryId, prefix: bool, (left, right): (&str, &str)) -> Query {
-        Query { id, prefix, kind: QueryKind::Phrase(vec![left.to_owned(), right.to_owned()]) }
-    }
 }
 
 impl fmt::Debug for Query {
@@ -153,9 +153,9 @@ fn create_query_tree(ctx: &Context, query: &str) -> Operation {
     let words = words.filter(|s| !s.contains(char::is_whitespace)).enumerate();
     let words: Vec<_> = words.collect();
 
-    let mut index = words.len();
     let mut ngrams = Vec::new();
     for ngram in 1..=MAX_NGRAM {
+
         let ngiter = words.windows(ngram).enumerate().map(|(i, group)| {
             let before = words[..i].windows(1);
             let after = words[i + ngram..].windows(1);
@@ -170,36 +170,46 @@ fn create_query_tree(ctx: &Context, query: &str) -> Operation {
                 let mut alts = Vec::new();
                 match words {
                     [(id, word)] => {
-                        let phrase = split_best_frequency(ctx, word)
-                            .map(|ws| Query::phrase2(0, is_last, ws))
-                            .map(Operation::Query);
+                        let mut idgen = ((id + 1) * 100)..;
+
+                        let phrase = split_best_frequency(ctx, word).map(|ws| {
+                            let id = idgen.next().unwrap();
+                            idgen.next().unwrap();
+                            Operation::phrase2(id, is_last, ws)
+                        });
 
                         let synonyms = fetch_synonyms(ctx, &[word]).into_iter().map(|alts| {
-                            let iter = alts.into_iter()
-                                .map(|w| Query::exact(0, false, &w))
-                                .map(Operation::Query);
+                            let iter = alts.into_iter().map(|w| {
+                                let id = idgen.next().unwrap();
+                                Operation::exact(id, false, &w)
+                            });
                             create_operation(iter, Operation::And)
                         });
 
-                        let query = Query::tolerant(0, is_last, word);
+                        let query = Operation::tolerant(*id, is_last, word);
 
-                        alts.push(Operation::Query(query));
+                        alts.push(query);
                         alts.extend(synonyms.chain(phrase));
                     },
                     words => {
                         let id = words[0].0;
+                        let mut idgen = ((id + 1) * 100_usize.pow(ngram as u32))..;
+
                         let words: Vec<_> = words.iter().map(|(_, s)| s.as_str()).collect();
 
                         for synonym in fetch_synonyms(ctx, &words) {
-                            let synonym = synonym.into_iter()
-                                .map(|s| Query::exact(0, false, &s))
-                                .map(Operation::Query);
+                            let synonym = synonym.into_iter().map(|s| {
+                                let id = idgen.next().unwrap();
+                                Operation::exact(id, false, &s)
+                            });
                             let synonym = create_operation(synonym, Operation::And);
                             alts.push(synonym);
                         }
 
-                        let query = Query::exact(0, is_last, &words.concat());
-                        alts.push(Operation::Query(query));
+                        let id = idgen.next().unwrap();
+                        let op = Operation::exact(id, is_last, &words.concat());
+
+                        alts.push(op);
                     }
                 }
 

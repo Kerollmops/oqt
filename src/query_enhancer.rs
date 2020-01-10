@@ -156,12 +156,7 @@ impl<S: AsRef<str>> QueryEnhancerBuilder<'_, S> {
 }
 
 /// Returns the query indices that represent this real query index.
-fn replacement(
-    origins: &[usize],
-    real_to_origin: &FakeIntervalTree,
-    real: u32,
-) -> Option<Range<u32>>
-{
+fn replacement(origins: &[usize], real_to_origin: &FakeIntervalTree, real: u32) -> Option<Range<u32>> {
     let real = real as usize;
 
     // query the fake interval tree with the real query index

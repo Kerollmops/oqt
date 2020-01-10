@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, BTreeSet};
+use std::hash::{Hash, Hasher};
 use std::time::Instant;
 use std::{cmp, fmt, iter::once};
 
@@ -13,7 +14,7 @@ use query_enhancer::{QueryEnhancer, QueryEnhancerBuilder};
 
 mod query_enhancer;
 
-#[derive(PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(PartialEq, Eq, Hash)]
 enum Operation {
     And(Vec<Operation>),
     Or(Vec<Operation>),
@@ -56,14 +57,27 @@ impl Operation {
 
 type QueryId = usize;
 
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Eq)]
 struct Query {
     id: QueryId,
     prefix: bool,
     kind: QueryKind,
 }
 
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+impl PartialEq for Query {
+    fn eq(&self, other: &Self) -> bool {
+        self.prefix == other.prefix && self.kind == other.kind
+    }
+}
+
+impl Hash for Query {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.prefix.hash(state);
+        self.kind.hash(state);
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
 enum QueryKind {
     Tolerant(String),
     Exact(String),

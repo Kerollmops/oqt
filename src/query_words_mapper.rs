@@ -29,13 +29,40 @@ impl QueryWordsMapper {
 
         let replacement: Vec<_> = replacement.into_iter().map(|s| s.to_string()).collect();
 
-        // If the replacement words match more words than the replaced range,
-        // grow the replaced range to match a maximum of words.
-        if self.originals.iter().skip(range.start).take(replacement.len()).eq(&replacement) {
-            range = range.start..replacement.len();
+        assert!(!replacement.is_empty());
+
+        // We detect words at the end and at the front of the
+        // replacement that are common with the originals:
+        //
+        //     x a b c d e f g
+        //          /   \
+        //     a b x c d k j e f
+        //     ^^^           ^^^
+        //
+
+        let left = &self.originals[..range.start];
+        let right = &self.originals[range.end..];
+
+        let common_left = longest_common_prefix(left, &replacement);
+        let common_right = longest_common_prefix(&replacement, right);
+
+        for i in 0..common_left {
+            let range = range.start - common_left + i..range.start - common_left + i + 1;
+            let replacement = vec![replacement[i].clone()];
+            self.mappings.insert(id + i, (range, replacement));
         }
 
-        self.mappings.insert(id, (range, replacement));
+        {
+            let replacement = replacement[common_left..replacement.len() - common_right].iter().cloned().collect();
+            self.mappings.insert(id + common_left, (range.clone(), replacement));
+        }
+
+        for i in 0..common_right {
+            let id = id + replacement.len() - common_right + i;
+            let range = range.end + i..range.end + i + 1;
+            let replacement = vec![replacement[replacement.len() - common_right + i].clone()];
+            self.mappings.insert(id, (range, replacement));
+        }
     }
 
     pub fn mapping(self) -> HashMap<QueryId, Range<usize>> {
@@ -90,6 +117,15 @@ impl QueryWordsMapper {
     }
 }
 
+fn longest_common_prefix<T: Eq>(a: &[T], b: &[T]) -> usize {
+    let mut best = (0, 0);
+    for i in 0..a.len() {
+        let count = a[i..].iter().zip(b).take_while(|(a, b)| a == b).count();
+        if count > best.1 { best = (i, count) }
+    }
+    best.1
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -120,6 +156,29 @@ mod tests {
         assert_eq!(mapping[&7], 0..1); // new
         assert_eq!(mapping[&8], 1..2); // york
         assert_eq!(mapping[&9], 2..3); // city
+    }
+
+    #[test]
+    fn original_unmodified2() {
+        let query = ["new", "york", "city", "subway"];
+        //             0       1       2        3
+        let mut builder = QueryWordsMapper::new(&query);
+
+        // city subway = new york city underground train
+        builder.declare(2..4, 4, &["new", "york", "city", "underground", "train"]);
+        //                    ^      4      5       6           7           8
+
+        let mapping = builder.mapping();
+
+        assert_eq!(mapping[&0], 0..1); // new
+        assert_eq!(mapping[&1], 1..2); // york
+        assert_eq!(mapping[&2], 2..3); // city
+        assert_eq!(mapping[&3], 3..5); // subway
+        assert_eq!(mapping[&4], 0..1); // new
+        assert_eq!(mapping[&5], 1..2); // york
+        assert_eq!(mapping[&6], 2..3); // city
+        assert_eq!(mapping[&7], 3..4); // underground
+        assert_eq!(mapping[&8], 4..5); // train
     }
 
     #[test]

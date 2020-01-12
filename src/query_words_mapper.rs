@@ -19,7 +19,7 @@ impl QueryWordsMapper {
         QueryWordsMapper { originals, mappings: HashMap::new() }
     }
 
-    pub fn declare<I, A>(&mut self, mut range: Range<usize>, id: QueryId, replacement: I)
+    pub fn declare<I, A>(&mut self, range: Range<usize>, id: QueryId, replacement: I)
     where I: IntoIterator<Item = A>,
           A: ToString,
     {
@@ -179,6 +179,40 @@ mod tests {
         assert_eq!(mapping[&6], 2..3); // city
         assert_eq!(mapping[&7], 3..4); // underground
         assert_eq!(mapping[&8], 4..5); // train
+    }
+
+    #[test]
+    fn original_unmodified3() {
+        let query = ["a", "b", "x", "x", "a", "b", "c", "d", "e", "f", "g"];
+        //            0    1    2    3    4    5    6    7    8    9    10
+        let mut builder = QueryWordsMapper::new(&query);
+
+        // c d = a b x c d k j e f
+        builder.declare(6..8, 11, &["a", "b", "x", "c", "d", "k", "j", "e", "f"]);
+        //                    ^^    11   12   13   14   15   16   17   18   19
+
+        let mapping = builder.mapping();
+
+        assert_eq!(mapping[&0],  0..1); // a
+        assert_eq!(mapping[&1],  1..2); // b
+        assert_eq!(mapping[&2],  2..3); // x
+        assert_eq!(mapping[&3],  3..4); // x
+        assert_eq!(mapping[&4],  4..5); // a
+        assert_eq!(mapping[&5],  5..6); // b
+        assert_eq!(mapping[&6],  6..7); // c
+        assert_eq!(mapping[&7],  7..10); // d
+        assert_eq!(mapping[&8],  10..11); // e
+        assert_eq!(mapping[&9],  11..12); // f
+        assert_eq!(mapping[&10], 12..13); // g
+        assert_eq!(mapping[&11], 3..4); // a
+        assert_eq!(mapping[&12], 4..5); // b
+        assert_eq!(mapping[&13], 5..6); // x
+        assert_eq!(mapping[&14], 6..7); // c
+        assert_eq!(mapping[&15], 7..8); // d
+        assert_eq!(mapping[&16], 8..9); // k
+        assert_eq!(mapping[&17], 9..10); // j
+        assert_eq!(mapping[&18], 10..11); // e
+        assert_eq!(mapping[&19], 11..12); // f
     }
 
     #[test]

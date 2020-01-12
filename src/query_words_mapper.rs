@@ -35,7 +35,7 @@ impl QueryWordsMapper {
         // replacement that are common with the originals:
         //
         //     x a b c d e f g
-        //          /   \
+        //       ^^^/   \^^^
         //     a b x c d k j e f
         //     ^^^           ^^^
         //
@@ -117,13 +117,17 @@ impl QueryWordsMapper {
     }
 }
 
-fn longest_common_prefix<T: Eq>(a: &[T], b: &[T]) -> usize {
-    let mut best = (0, 0);
-    for i in 0..a.len() {
+fn longest_common_prefix<T: Eq + std::fmt::Debug>(a: &[T], b: &[T]) -> usize {
+    let mut best = None;
+    for i in (0..a.len()).rev() {
         let count = a[i..].iter().zip(b).take_while(|(a, b)| a == b).count();
-        if count > best.1 { best = (i, count) }
+        best = match best {
+            Some(old) if count > old => Some(count),
+            Some(_) => break,
+            None => Some(count),
+        };
     }
-    best.1
+    best.unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -150,9 +154,11 @@ mod tests {
         assert_eq!(mapping[&1], 1..2); // york
         assert_eq!(mapping[&2], 2..3); // city
         assert_eq!(mapping[&3], 3..4); // subway
+
         assert_eq!(mapping[&4], 0..1); // new
         assert_eq!(mapping[&5], 1..2); // york
         assert_eq!(mapping[&6], 2..3); // city
+
         assert_eq!(mapping[&7], 0..1); // new
         assert_eq!(mapping[&8], 1..2); // york
         assert_eq!(mapping[&9], 2..3); // city
@@ -174,6 +180,7 @@ mod tests {
         assert_eq!(mapping[&1], 1..2); // york
         assert_eq!(mapping[&2], 2..3); // city
         assert_eq!(mapping[&3], 3..5); // subway
+
         assert_eq!(mapping[&4], 0..1); // new
         assert_eq!(mapping[&5], 1..2); // york
         assert_eq!(mapping[&6], 2..3); // city
@@ -200,19 +207,20 @@ mod tests {
         assert_eq!(mapping[&4],  4..5); // a
         assert_eq!(mapping[&5],  5..6); // b
         assert_eq!(mapping[&6],  6..7); // c
-        assert_eq!(mapping[&7],  7..10); // d
-        assert_eq!(mapping[&8],  10..11); // e
-        assert_eq!(mapping[&9],  11..12); // f
-        assert_eq!(mapping[&10], 12..13); // g
-        assert_eq!(mapping[&11], 3..4); // a
-        assert_eq!(mapping[&12], 4..5); // b
-        assert_eq!(mapping[&13], 5..6); // x
-        assert_eq!(mapping[&14], 6..7); // c
-        assert_eq!(mapping[&15], 7..8); // d
-        assert_eq!(mapping[&16], 8..9); // k
-        assert_eq!(mapping[&17], 9..10); // j
-        assert_eq!(mapping[&18], 10..11); // e
-        assert_eq!(mapping[&19], 11..12); // f
+        assert_eq!(mapping[&7],  7..11); // d
+        assert_eq!(mapping[&8],  11..12); // e
+        assert_eq!(mapping[&9],  12..13); // f
+        assert_eq!(mapping[&10], 13..14); // g
+
+        assert_eq!(mapping[&11], 4..5); // a
+        assert_eq!(mapping[&12], 5..6); // b
+        assert_eq!(mapping[&13], 6..7); // x
+        assert_eq!(mapping[&14], 7..8); // c
+        assert_eq!(mapping[&15], 8..9); // d
+        assert_eq!(mapping[&16], 9..10); // k
+        assert_eq!(mapping[&17], 10..11); // j
+        assert_eq!(mapping[&18], 11..12); // e
+        assert_eq!(mapping[&19], 12..13); // f
     }
 
     #[test]

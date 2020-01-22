@@ -7,7 +7,6 @@ use std::time::Instant;
 use std::{cmp, fmt, iter::once};
 
 use big_s::S;
-use intervaltree::IntervalTree;
 use itertools::{EitherOrBoth, merge_join_by};
 use maplit::hashmap;
 use query_words_mapper::QueryWordsMapper;
@@ -142,13 +141,6 @@ fn split_best_frequency<'a>(ctx: &Context, word: &'a str) -> Option<(&'a str, &'
 fn fetch_synonyms<S: AsRef<str>>(ctx: &Context, words: &[S]) -> Vec<Vec<String>> {
     let words: Vec<_> = words.iter().map(|s| s.as_ref().to_owned()).collect(); // TODO ugly
     ctx.synonyms.get(&words).cloned().unwrap_or_default()
-}
-
-fn is_last<I: IntoIterator>(iter: I) -> impl Iterator<Item=(bool, I::Item)> {
-    let mut iter = iter.into_iter().peekable();
-    core::iter::from_fn(move || {
-        iter.next().map(|item| (iter.peek().is_none(), item))
-    })
 }
 
 fn create_operation<I, F>(iter: I, f: F) -> Operation

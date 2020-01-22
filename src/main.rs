@@ -7,12 +7,13 @@ use std::time::Instant;
 use std::{cmp, fmt, iter::once};
 
 use big_s::S;
+use intervaltree::IntervalTree;
+use itertools::{EitherOrBoth, merge_join_by};
 use maplit::hashmap;
+use query_words_mapper::QueryWordsMapper;
 use rand::{Rng, SeedableRng, rngs::StdRng};
 use sdset::{Set, SetBuf, SetOperation};
 use slice_group_by::StrGroupBy;
-use itertools::{EitherOrBoth, merge_join_by};
-use query_words_mapper::QueryWordsMapper;
 
 mod query_words_mapper;
 
@@ -79,7 +80,7 @@ impl Hash for Query {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum QueryKind {
     Tolerant(String),
     Exact(String),
@@ -138,8 +139,8 @@ fn split_best_frequency<'a>(ctx: &Context, word: &'a str) -> Option<(&'a str, &'
     best.map(|(_, l, r)| (l, r))
 }
 
-fn fetch_synonyms(ctx: &Context, words: &[&str]) -> Vec<Vec<String>> {
-    let words: Vec<_> = words.iter().map(|s| s.to_string()).collect(); // TODO ugly
+fn fetch_synonyms<S: AsRef<str>>(ctx: &Context, words: &[S]) -> Vec<Vec<String>> {
+    let words: Vec<_> = words.iter().map(|s| s.as_ref().to_owned()).collect(); // TODO ugly
     ctx.synonyms.get(&words).cloned().unwrap_or_default()
 }
 
@@ -169,26 +170,22 @@ fn create_query_tree(ctx: &Context, query: &str) -> (Operation, HashMap<QueryId,
     let words: Vec<_> = words.filter(|s| !s.contains(char::is_whitespace)).enumerate().collect();
 
     let mut mapper = QueryWordsMapper::new(words.iter().map(|(_, w)| w));
-    let mut ngrams = Vec::new();
-    for ngram in 1..=MAX_NGRAM {
 
-        let ngiter = words.windows(ngram).enumerate().map(|(i, group)| {
-            let before = words[0..i].windows(1).enumerate().map(|(i, g)| (i..i+1, g));
-            let after = words[i + ngram..].windows(1)
-                .enumerate()
-                .map(move |(j, g)| (i + j + ngram..i + j + ngram + 1, g));
-            before.chain(Some((i..i + ngram, group))).chain(after)
-        });
+    fn create_inner(ctx: &Context, mapper: &mut QueryWordsMapper, words: &[(usize, String)]) -> Vec<Operation> {
+        let mut alts = Vec::new();
 
-        for group in ngiter {
+        for ngram in 1..=MAX_NGRAM {
+            if let Some(group) = words.get(..ngram) {
+                let mut group_ops = Vec::new();
 
-            let mut ops = Vec::new();
-            for (is_last, (range, words)) in is_last(group) {
+                let tail = &words[ngram..];
+                let is_last = tail.is_empty();
 
-                let mut alts = Vec::new();
-                match words {
+                let mut group_alts = Vec::new();
+                match group {
                     [(id, word)] => {
                         let mut idgen = ((id + 1) * 100)..;
+                        let range = (*id)..id+1;
 
                         let phrase = split_best_frequency(ctx, word).map(|ws| {
                             let id = idgen.next().unwrap();
@@ -210,14 +207,15 @@ fn create_query_tree(ctx: &Context, query: &str) -> (Operation, HashMap<QueryId,
                             create_operation(iter, Operation::And)
                         });
 
-                        let query = Operation::tolerant(*id, is_last, word);
+                        let original = Operation::tolerant(*id, is_last, word);
 
-                        alts.push(query);
-                        alts.extend(synonyms.chain(phrase));
+                        group_alts.push(original);
+                        group_alts.extend(synonyms.chain(phrase));
                     },
                     words => {
                         let id = words[0].0;
                         let mut idgen = ((id + 1) * 100_usize.pow(ngram as u32))..;
+                        let range = id..id+ngram;
 
                         let words: Vec<_> = words.iter().map(|(_, s)| s.as_str()).collect();
 
@@ -230,26 +228,32 @@ fn create_query_tree(ctx: &Context, query: &str) -> (Operation, HashMap<QueryId,
                                 let id = idgen.next().unwrap();
                                 Operation::exact(id, false, &s)
                             });
-                            alts.push(create_operation(synonym, Operation::And));
+                            group_alts.push(create_operation(synonym, Operation::And));
                         }
 
                         let id = idgen.next().unwrap();
                         let concat = words.concat();
-                        alts.push(Operation::exact(id, is_last, &concat));
-                        mapper.declare(range.clone(), id, &[concat]);
+                        mapper.declare(range.clone(), id, &[&concat]);
+                        group_alts.push(Operation::exact(id, is_last, &concat));
                     }
                 }
 
-                ops.push(create_operation(alts, Operation::Or));
-            }
+                group_ops.push(create_operation(group_alts, Operation::Or));
 
-            ngrams.push(create_operation(ops, Operation::And));
-            if ngram == 1 { break }
+                if !tail.is_empty() {
+                    let tail_ops = create_inner(ctx, mapper, tail);
+                    group_ops.push(create_operation(tail_ops, Operation::Or));
+                }
+
+                alts.push(create_operation(group_ops, Operation::And));
+            }
         }
+
+        alts
     }
 
+    let operation = Operation::Or(create_inner(ctx, &mut mapper, &words));
     let mapping = mapper.mapping();
-    let operation = create_operation(ngrams, Operation::Or);
 
     (operation, mapping)
 }
